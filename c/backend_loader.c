@@ -104,6 +104,11 @@ typedef int (*fn_pipe_router)(int device,const float *x_dev,const void *rw_dev,c
 typedef int (*fn_pipe_rope)(int device,float *v_dev,const int *pos_dev,int rows, int stride,int offset,int R,int heads,float theta);
 typedef int (*fn_pipe_rope_base)(int device,float *v_dev,int pos_base,int rows, int stride,int offset,int R,int heads,float theta);
 typedef int (*fn_pipe_rope_interleaved)(int device,float *v_dev,int position,int n_heads,int head_dim,int rope_dims,float theta);
+typedef int (*fn_pipe_qg_split)(int device,float *q_dev,float *gate_dev,const float *qg_dev,int n_heads,int head_dim);
+typedef int (*fn_pipe_rope_neox)(int device,float *v_dev,int position,int n_heads,int head_dim,int rope_dims,float theta);
+typedef int (*fn_pipe_sigmoid_mul)(int device,float *x_dev,const float *gate_dev,size_t n);
+typedef int (*fn_pipe_sigmoid_scale)(int device,float *x_dev,const float *logit_dev,size_t n);
+typedef int (*fn_pipe_gated_delta_decode)(int device,float *out_dev,const float *qkv_dev,const float *z_dev,const float *ba_dev,const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps);
 typedef int (*fn_pipe_rows_add)(int device,float *x_dev,const float *partial_dev, const int *rows_dev,int nrows,int D);
 typedef float * (*fn_pipe_scratch)(int device,int slot,size_t bytes);
 typedef int (*fn_pipe_silu_mul)(int device,float *gate_dev,const float *up_dev,size_t n);
@@ -168,6 +173,11 @@ static struct {
     fn_pipe_rope pipe_rope;
     fn_pipe_rope_base pipe_rope_base;
     fn_pipe_rope_interleaved pipe_rope_interleaved;
+    fn_pipe_qg_split pipe_qg_split;
+    fn_pipe_rope_neox pipe_rope_neox;
+    fn_pipe_sigmoid_mul pipe_sigmoid_mul;
+    fn_pipe_sigmoid_scale pipe_sigmoid_scale;
+    fn_pipe_gated_delta_decode pipe_gated_delta_decode;
     fn_pipe_rows_add pipe_rows_add;
     fn_pipe_scratch pipe_scratch;
     fn_pipe_silu_mul pipe_silu_mul;
@@ -279,6 +289,11 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_rope, fn_pipe_rope)
     RESOLVE(pipe_rope_base, fn_pipe_rope_base)
     RESOLVE(pipe_rope_interleaved, fn_pipe_rope_interleaved)
+    RESOLVE(pipe_qg_split, fn_pipe_qg_split)
+    RESOLVE(pipe_rope_neox, fn_pipe_rope_neox)
+    RESOLVE(pipe_sigmoid_mul, fn_pipe_sigmoid_mul)
+    RESOLVE(pipe_sigmoid_scale, fn_pipe_sigmoid_scale)
+    RESOLVE(pipe_gated_delta_decode, fn_pipe_gated_delta_decode)
     RESOLVE(pipe_rows_add, fn_pipe_rows_add)
     RESOLVE(pipe_scratch, fn_pipe_scratch)
     RESOLVE(pipe_silu_mul, fn_pipe_silu_mul)
@@ -555,6 +570,21 @@ int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows, int 
 }
 int coli_cuda_pipe_rope_interleaved(int device,float *v_dev,int position,int n_heads,int head_dim,int rope_dims,float theta){
     if(!g_cuda.available)return 0;return g_cuda.pipe_rope_interleaved(device,v_dev,position,n_heads,head_dim,rope_dims,theta);
+}
+int coli_cuda_pipe_qg_split(int device,float *q_dev,float *gate_dev,const float *qg_dev,int n_heads,int head_dim){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_qg_split(device,q_dev,gate_dev,qg_dev,n_heads,head_dim);
+}
+int coli_cuda_pipe_rope_neox(int device,float *v_dev,int position,int n_heads,int head_dim,int rope_dims,float theta){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_rope_neox(device,v_dev,position,n_heads,head_dim,rope_dims,theta);
+}
+int coli_cuda_pipe_sigmoid_mul(int device,float *x_dev,const float *gate_dev,size_t n){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_sigmoid_mul(device,x_dev,gate_dev,n);
+}
+int coli_cuda_pipe_sigmoid_scale(int device,float *x_dev,const float *logit_dev,size_t n){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_sigmoid_scale(device,x_dev,logit_dev,n);
+}
+int coli_cuda_pipe_gated_delta_decode(int device,float *out_dev,const float *qkv_dev,const float *z_dev,const float *ba_dev,const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_gated_delta_decode(device,out_dev,qkv_dev,z_dev,ba_dev,conv_weight_dev,dt_bias_dev,a_dev,norm_weight_dev,conv_state_dev,recurrent_state_dev,n_key_heads,n_value_heads,head_dim,conv_kernel,eps);
 }
 
 

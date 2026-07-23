@@ -1388,6 +1388,88 @@ __global__ static void pipe_rope_interleaved_kernel(float *v,int position,int he
     }
 }
 
+
+__global__ static void pipe_qg_split_kernel(float *q,float *gate,const float *qg,
+        int n_heads,int head_dim){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    size_t n=(size_t)n_heads*head_dim;if(i>=n)return;
+    int h=(int)(i/head_dim),d=(int)(i-(size_t)h*head_dim);
+    const float *src=qg+(size_t)h*2*head_dim;
+    q[i]=src[d];gate[i]=src[head_dim+d];
+}
+
+__global__ static void pipe_rope_neox_kernel(float *v,int position,int head_dim,
+        int rope_dims,float theta){
+    int h=blockIdx.x,half=rope_dims/2;float *head=v+(size_t)h*head_dim;
+    for(int i=threadIdx.x;i<half;i+=blockDim.x){
+        float ang=position*__powf(theta,-2.0f*i/rope_dims),cs=__cosf(ang),sn=__sinf(ang);
+        float a=head[i],b=head[half+i];head[i]=a*cs-b*sn;head[half+i]=a*sn+b*cs;
+    }
+}
+
+__global__ static void pipe_sigmoid_mul_n(float *x,const float *gate,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){float g=gate[i];float sig=g>=0.f?1.f/(1.f+expf(-g)):expf(g)/(1.f+expf(g));x[i]*=sig;}
+}
+
+__global__ static void pipe_sigmoid_scale_n(float *x,const float *logit,size_t n){
+    __shared__ float sig;
+    if(threadIdx.x==0){float g=*logit;sig=g>=0.f?1.f/(1.f+expf(-g)):expf(g)/(1.f+expf(g));}
+    __syncthreads();
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)x[i]*=sig;
+}
+
+__device__ static float qwen_softplus_device(float x){
+    if(x>20.f) return x;
+    if(x<-20.f) return expf(x);
+    return log1pf(expf(x));
+}
+
+__global__ static void qwen_conv_update_kernel(const float *input,float *output,
+        const float *weight,float *state,int channels,int kernel){
+    int c=(int)blockIdx.x*blockDim.x+threadIdx.x;if(c>=channels)return;
+    float *s=state+(size_t)c*kernel;const float *w=weight+(size_t)c*kernel;
+    for(int j=0;j+1<kernel;j++) s[j]=s[j+1];
+    s[kernel-1]=input[c];
+    float acc=0.f;for(int j=0;j<kernel;j++)acc+=s[j]*w[j];
+    output[c]=acc/(1.f+expf(-acc));
+}
+
+__global__ static void qwen_gated_delta_kernel(float *out,const float *conv,
+        const float *z,const float *ba,const float *dt,const float *a,const float *norm,
+        float *state,int nk,int nv,int D,float eps){
+    int vh=blockIdx.x,tid=threadIdx.x,ratio=nv/nk,kh=vh/ratio,sub=vh%ratio;
+    extern __shared__ float sh[];float *q=sh,*k=q+D,*core=k+D,*red=core+D;
+    const float *qsrc=conv+(size_t)kh*D;
+    const float *ksrc=conv+(size_t)nk*D+(size_t)kh*D;
+    const float *vsrc=conv+(size_t)2*nk*D+(size_t)vh*D;
+    if(tid<D){q[tid]=qsrc[tid];k[tid]=ksrc[tid];red[tid]=q[tid]*q[tid];}
+    else if(tid<256)red[tid]=0.f;
+    __syncthreads();
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)red[tid]+=red[tid+stride];__syncthreads();}
+    float iq=rsqrtf(red[0]+1e-6f);
+    if(tid<D){q[tid]*=iq;red[tid]=k[tid]*k[tid];}else if(tid<256)red[tid]=0.f;
+    __syncthreads();
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)red[tid]+=red[tid+stride];__syncthreads();}
+    float ik=rsqrtf(red[0]+1e-6f);if(tid<D)k[tid]*=ik;__syncthreads();
+
+    int base=kh*2*ratio;float braw=ba[base+sub],araw=ba[base+ratio+sub];
+    float beta=braw>=0.f?1.f/(1.f+expf(-braw)):expf(braw)/(1.f+expf(braw));
+    float decay=expf(a[vh]*qwen_softplus_device(araw+dt[vh]));
+    if(tid<D){
+        int col=tid;float *Sc=state+((size_t)vh*D+col)*D;float kv=0.f;
+        for(int i=0;i<D;i++)kv+=Sc[i]*k[i];
+        float delta=(vsrc[col]-decay*kv)*beta,y=0.f;
+        for(int i=0;i<D;i++){float sv=decay*Sc[i]+k[i]*delta;Sc[i]=sv;y+=sv*q[i];}
+        core[col]=y*rsqrtf((float)D);red[col]=core[col]*core[col];
+    }else if(tid<256)red[tid]=0.f;
+    __syncthreads();
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)red[tid]+=red[tid+stride];__syncthreads();}
+    float inv=rsqrtf(red[0]/D+eps);
+    if(tid<D){float g=z[(size_t)vh*D+tid];float silu=g/(1.f+expf(-g));out[(size_t)vh*D+tid]=core[tid]*inv*norm[tid]*silu;}
+}
+
 __global__ static void pipe_add_n(float *x,const float *t,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n) x[i]+=t[i];
@@ -1519,6 +1601,55 @@ extern "C" int coli_cuda_pipe_rope_interleaved(int device,float *v_dev,int posit
        (rope_dims&1)||!select_ctx(ctx))return 0;
     pipe_rope_interleaved_kernel<<<n_heads,128>>>(v_dev,position,head_dim,rope_dims,theta);
     return cuda_ok(cudaGetLastError(),"pipe interleaved rope");
+}
+
+extern "C" int coli_cuda_pipe_qg_split(int device,float *q_dev,float *gate_dev,
+        const float *qg_dev,int n_heads,int head_dim){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!q_dev||!gate_dev||!qg_dev||n_heads<1||head_dim<1||!select_ctx(ctx))return 0;
+    size_t n=(size_t)n_heads*head_dim;
+    pipe_qg_split_kernel<<<(unsigned)((n+255)/256),256>>>(q_dev,gate_dev,qg_dev,n_heads,head_dim);
+    return cuda_ok(cudaGetLastError(),"pipe Q/gate split");
+}
+
+extern "C" int coli_cuda_pipe_rope_neox(int device,float *v_dev,int position,
+        int n_heads,int head_dim,int rope_dims,float theta){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!v_dev||position<0||n_heads<1||head_dim<2||rope_dims<2||rope_dims>head_dim||
+       (rope_dims&1)||!select_ctx(ctx))return 0;
+    pipe_rope_neox_kernel<<<n_heads,128>>>(v_dev,position,head_dim,rope_dims,theta);
+    return cuda_ok(cudaGetLastError(),"pipe neox rope");
+}
+extern "C" int coli_cuda_pipe_sigmoid_mul(int device,float *x_dev,const float *gate_dev,size_t n){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!x_dev||!gate_dev||!n||!select_ctx(ctx))return 0;
+    pipe_sigmoid_mul_n<<<(unsigned)((n+255)/256),256>>>(x_dev,gate_dev,n);
+    return cuda_ok(cudaGetLastError(),"pipe sigmoid multiply");
+}
+extern "C" int coli_cuda_pipe_sigmoid_scale(int device,float *x_dev,const float *logit_dev,size_t n){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!x_dev||!logit_dev||!n||!select_ctx(ctx))return 0;
+    pipe_sigmoid_scale_n<<<(unsigned)((n+255)/256),256>>>(x_dev,logit_dev,n);
+    return cuda_ok(cudaGetLastError(),"pipe sigmoid scale");
+}
+extern "C" int coli_cuda_pipe_gated_delta_decode(int device,float *out_dev,
+        const float *qkv_dev,const float *z_dev,const float *ba_dev,
+        const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,
+        const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,
+        int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!out_dev||!qkv_dev||!z_dev||!ba_dev||!conv_weight_dev||!dt_bias_dev||!a_dev||
+       !norm_weight_dev||!conv_state_dev||!recurrent_state_dev||n_key_heads<1||
+       n_value_heads<n_key_heads||n_value_heads%n_key_heads||head_dim<1||head_dim>256||
+       conv_kernel<1||conv_kernel>16||!select_ctx(ctx))return 0;
+    int conv_dim=(2*n_key_heads+n_value_heads)*head_dim;
+    float *conv=coli_cuda_pipe_scratch(device,25,(size_t)conv_dim*sizeof(float));if(!conv)return 0;
+    qwen_conv_update_kernel<<<(conv_dim+255)/256,256>>>(qkv_dev,conv,conv_weight_dev,conv_state_dev,conv_dim,conv_kernel);
+    if(!cuda_ok(cudaGetLastError(),"qwen causal conv"))return 0;
+    size_t shared=((size_t)3*head_dim+256)*sizeof(float);
+    qwen_gated_delta_kernel<<<n_value_heads,256,shared>>>(out_dev,conv,z_dev,ba_dev,dt_bias_dev,a_dev,
+        norm_weight_dev,recurrent_state_dev,n_key_heads,n_value_heads,head_dim,eps);
+    return cuda_ok(cudaGetLastError(),"qwen gated delta decode");
 }
 /* ---- device router (#431 PR-A) -------------------------------------------
  * Router for one decode row, entirely on the layer's home device: logits GEMV

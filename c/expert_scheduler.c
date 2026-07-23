@@ -194,6 +194,34 @@ int coli_expert_repin_pick(const ColiExpertLayerStore *s,
                           ids_stack, s->npin, pin_index, candidate_eid, gain);
 }
 
+int coli_expert_repin_promote_cached(ColiExpertLayerStore *s,
+                                     int pin_index, int candidate_eid,
+                                     int layer,
+                                     const ColiExpertStorageOps *ops,
+                                     void *ctx) {
+    if (!s || !s->pin || pin_index < 0 || pin_index >= s->npin ||
+        candidate_eid < 0 || candidate_eid >= s->n_experts) return -1;
+    ColiExpertLookup h = coli_expert_lookup(s, candidate_eid, 0);
+    if (!h.slot || h.from_pin) return 0;
+    if (!ops || !ops->evict || !s->layout.stride) return -1;
+
+    void *pin = coli_expert_slot_at(s->pin, &s->layout, pin_index);
+    unsigned char *tmp = (unsigned char *)malloc(s->layout.stride);
+    if (!pin || !tmp) { free(tmp); return -1; }
+    memcpy(tmp, pin, s->layout.stride);
+    memcpy(pin, h.slot, s->layout.stride);
+    memcpy(h.slot, tmp, s->layout.stride);
+    free(tmp);
+
+    /* h.slot now owns the replaced pin payload. Release that storage while
+     * the promoted candidate remains alive exclusively in the pin slot. */
+    ops->evict(ctx, layer, h.slot);
+    coli_expert_slot_set_eid(h.slot, &s->layout, -1);
+    coli_expert_slot_set_used(h.slot, &s->layout, 0);
+    coli_expert_slot_touch(pin, &s->layout, s->clock);
+    return 1;
+}
+
 void coli_expert_decay_heat(ColiExpertLayerStore *s) {
     if (s && s->heat && s->n_experts > 0) tier_decay(s->heat, s->n_experts);
 }

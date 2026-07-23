@@ -173,6 +173,20 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos
                              int stride,int offset,int R,int heads,float theta);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_interleaved(int device,float *v_dev,int position,
                              int n_heads,int head_dim,int rope_dims,float theta);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_qg_split(int device,float *q_dev,float *gate_dev,
+        const float *qg_dev,int n_heads,int head_dim);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_neox(int device,float *v_dev,int position,
+                             int n_heads,int head_dim,int rope_dims,float theta);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sigmoid_mul(int device,float *x_dev,const float *gate_dev,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sigmoid_scale(int device,float *x_dev,const float *logit_dev,size_t n);
+/* One-token Gated DeltaNet update. qkv is family-major [all Q, all K, all V];
+ * ba is grouped [beta..., alpha...] inside each key-head group. GGUF `a` is
+ * already -exp(A_log). State is kept transposed per head: [column][key_dim]. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_gated_delta_decode(int device,float *out_dev,
+        const float *qkv_dev,const float *z_dev,const float *ba_dev,
+        const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,
+        const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,
+        int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps);
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
         const float *weights, int count,

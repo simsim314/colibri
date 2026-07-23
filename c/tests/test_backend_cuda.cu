@@ -30,6 +30,29 @@ static int relative_rms(const float *got,const float *want,int n,float limit){
     if(r>limit){std::fprintf(stderr,"relative RMS %.5f exceeds %.5f\n",r,limit);return 0;} return 1;
 }
 
+static float host_silu(float x){return x/(1.f+std::exp(-x));}
+static float host_softplus(float x){if(x>20.f)return x;if(x<-20.f)return std::exp(x);return std::log1p(std::exp(x));}
+static void qwen_gdn_oracle(float *out,const float *qkv,const float *z,const float *ba,
+        const float *cw,const float *dt,const float *a,const float *nw,float *cs,float *rs,
+        int nk,int nv,int D,int K,float eps){
+    const int cd=(2*nk+nv)*D;float conv[128]={0};
+    if(cd>(int)(sizeof(conv)/sizeof(conv[0])))std::abort();
+    for(int c=0;c<cd;c++){float *st=cs+c*K;for(int j=0;j+1<K;j++)st[j]=st[j+1];st[K-1]=qkv[c];
+        float v=0;for(int j=0;j<K;j++)v+=st[j]*cw[c*K+j];conv[c]=host_silu(v);}
+    const int ratio=nv/nk;
+    for(int vh=0;vh<nv;vh++){int kh=vh/ratio,sub=vh%ratio,base=kh*2*ratio;
+        float q[16],k[16];double q2=0,k2=0;for(int i=0;i<D;i++){q[i]=conv[kh*D+i];k[i]=conv[nk*D+kh*D+i];q2+=(double)q[i]*q[i];k2+=(double)k[i]*k[i];}
+        float qi=1.f/std::sqrt((float)q2+1e-6f),ki=1.f/std::sqrt((float)k2+1e-6f);
+        for(int i=0;i<D;i++){q[i]*=qi;k[i]*=ki;}
+        float b=1.f/(1.f+std::exp(-ba[base+sub]));float decay=std::exp(a[vh]*host_softplus(ba[base+ratio+sub]+dt[vh]));
+        float core[16];for(int col=0;col<D;col++){float *Sc=rs+(vh*D+col)*D;float kv=0;for(int i=0;i<D;i++)kv+=Sc[i]*k[i];
+            float delta=(conv[2*nk*D+vh*D+col]-decay*kv)*b,y=0;
+            for(int i=0;i<D;i++){Sc[i]=decay*Sc[i]+k[i]*delta;y+=Sc[i]*q[i];}core[col]=y/std::sqrt((float)D);}
+        double ss=0;for(int i=0;i<D;i++)ss+=(double)core[i]*core[i];float inv=1.f/std::sqrt((float)(ss/D)+eps);
+        for(int i=0;i<D;i++)out[vh*D+i]=core[i]*inv*nw[i]*host_silu(z[vh*D+i]);
+    }
+}
+
 int main(int argc, char **argv) {
     int devices[COLI_CUDA_MAX_DEVICES], ndev = argc > 1 ? argc - 1 : 1;
     if (ndev > COLI_CUDA_MAX_DEVICES) return 2;
@@ -90,6 +113,77 @@ int main(int argc, char **argv) {
         for(int i=0;i<256;i++)if(std::fabs(decoded[i]-3.f)>1e-5f)return 1;
         coli_cuda_pipe_free(d0,dx);coli_cuda_pipe_free(d0,dy);coli_cuda_pipe_free(d0,dr);
         coli_cuda_tensor_free(view);coli_cuda_tensor_free(base);
+    }
+
+    /* Qwen3-Next resident primitives: partial NeoX RoPE, sigmoid gates,
+     * causal-conv state, and one-token Gated DeltaNet recurrence. */
+    {
+        {
+            const int H=2,D=2;float raw[8]={1,2,10,20,3,4,30,40},q[4],g[4];
+            float *dr=(float*)coli_cuda_pipe_alloc(d0,sizeof(raw));
+            float *dq=(float*)coli_cuda_pipe_alloc(d0,sizeof(q));
+            float *dg0=(float*)coli_cuda_pipe_alloc(d0,sizeof(g));
+            if(!dr||!dq||!dg0||!coli_cuda_pipe_upload(d0,dr,raw,sizeof(raw))||
+               !coli_cuda_pipe_qg_split(d0,dq,dg0,dr,H,D)||
+               !coli_cuda_pipe_download(d0,dq,q,sizeof(q))||!coli_cuda_pipe_download(d0,dg0,g,sizeof(g)))return 1;
+            float qw[4]={1,2,3,4},gw[4]={10,20,30,40};
+            if(!close_enough(q,qw,4)||!close_enough(g,gw,4))return 1;
+            coli_cuda_pipe_free(d0,dr);coli_cuda_pipe_free(d0,dq);coli_cuda_pipe_free(d0,dg0);
+        }
+        float hx[4]={1,2,3,4},gate[4]={0,20,-20,0},logit[1]={0};
+        float *dx=(float*)coli_cuda_pipe_alloc(d0,sizeof(hx));
+        float *dg=(float*)coli_cuda_pipe_alloc(d0,sizeof(gate));
+        float *dl=(float*)coli_cuda_pipe_alloc(d0,sizeof(logit));
+        if(!dx||!dg||!dl||!coli_cuda_pipe_upload(d0,dx,hx,sizeof(hx))||
+           !coli_cuda_pipe_upload(d0,dg,gate,sizeof(gate))||
+           !coli_cuda_pipe_rope_neox(d0,dx,0,1,4,4,10000.f)||
+           !coli_cuda_pipe_sigmoid_mul(d0,dx,dg,4)||
+           !coli_cuda_pipe_download(d0,dx,hx,sizeof(hx)))return 1;
+        float swant[4]={.5f,2.f,0.f,2.f};if(!close_enough(hx,swant,4))return 1;
+        float ones[4]={1,1,1,1};if(!coli_cuda_pipe_upload(d0,dx,ones,sizeof(ones))||
+           !coli_cuda_pipe_upload(d0,dl,logit,sizeof(logit))||
+           !coli_cuda_pipe_sigmoid_scale(d0,dx,dl,4)||
+           !coli_cuda_pipe_download(d0,dx,hx,sizeof(hx)))return 1;
+        float half[4]={.5f,.5f,.5f,.5f};if(!close_enough(hx,half,4))return 1;
+        coli_cuda_pipe_free(d0,dx);coli_cuda_pipe_free(d0,dg);coli_cuda_pipe_free(d0,dl);
+
+        const int D=2,NK=1,NV=1,K=2,CD=(2*NK+NV)*D;
+        float qkv[CD]={1,0,1,0,2,3},z[2]={1,1},ba[2]={0,0};
+        float cw[CD*K];for(int c=0;c<CD;c++){cw[c*K]=0.f;cw[c*K+1]=1.f;}
+        float dt[1]={0},a[1]={-1},nw[2]={1,1};
+        float *dqkv=(float*)coli_cuda_pipe_alloc(d0,sizeof(qkv));
+        float *dz=(float*)coli_cuda_pipe_alloc(d0,sizeof(z));
+        float *dba=(float*)coli_cuda_pipe_alloc(d0,sizeof(ba));
+        float *dcw=(float*)coli_cuda_pipe_alloc(d0,sizeof(cw));
+        float *ddt=(float*)coli_cuda_pipe_alloc(d0,sizeof(dt));
+        float *da=(float*)coli_cuda_pipe_alloc(d0,sizeof(a));
+        float *dnw=(float*)coli_cuda_pipe_alloc(d0,sizeof(nw));
+        float *dcs=(float*)coli_cuda_pipe_alloc(d0,CD*K*sizeof(float));
+        float *drs=(float*)coli_cuda_pipe_alloc(d0,NV*D*D*sizeof(float));
+        float *doo=(float*)coli_cuda_pipe_alloc(d0,NV*D*sizeof(float));
+        float hcs[CD*K]={0},hrs[NV*D*D]={0},want[2],gout[2],gstate[NV*D*D],gcstate[CD*K];
+        qwen_gdn_oracle(want,qkv,z,ba,cw,dt,a,nw,hcs,hrs,NK,NV,D,K,1e-6f);
+        if(!dqkv||!dz||!dba||!dcw||!ddt||!da||!dnw||!dcs||!drs||!doo||
+           !coli_cuda_pipe_upload(d0,dqkv,qkv,sizeof(qkv))||!coli_cuda_pipe_upload(d0,dz,z,sizeof(z))||
+           !coli_cuda_pipe_upload(d0,dba,ba,sizeof(ba))||!coli_cuda_pipe_upload(d0,dcw,cw,sizeof(cw))||
+           !coli_cuda_pipe_upload(d0,ddt,dt,sizeof(dt))||!coli_cuda_pipe_upload(d0,da,a,sizeof(a))||
+           !coli_cuda_pipe_upload(d0,dnw,nw,sizeof(nw))||!coli_cuda_pipe_zero(d0,dcs,CD*K)||
+           !coli_cuda_pipe_zero(d0,drs,NV*D*D)||
+           !coli_cuda_pipe_gated_delta_decode(d0,doo,dqkv,dz,dba,dcw,ddt,da,dnw,dcs,drs,NK,NV,D,K,1e-6f)||
+           !coli_cuda_pipe_download(d0,doo,gout,sizeof(gout))||
+           !coli_cuda_pipe_download(d0,drs,gstate,sizeof(gstate))||
+           !coli_cuda_pipe_download(d0,dcs,gcstate,sizeof(gcstate)))return 1;
+        if(!close_enough(gout,want,2)||!close_enough(gstate,hrs,NV*D*D)||!close_enough(gcstate,hcs,CD*K))return 1;
+        float qkv2[CD]={0,1,0,1,1,-1};qwen_gdn_oracle(want,qkv2,z,ba,cw,dt,a,nw,hcs,hrs,NK,NV,D,K,1e-6f);
+        if(!coli_cuda_pipe_upload(d0,dqkv,qkv2,sizeof(qkv2))||
+           !coli_cuda_pipe_gated_delta_decode(d0,doo,dqkv,dz,dba,dcw,ddt,da,dnw,dcs,drs,NK,NV,D,K,1e-6f)||
+           !coli_cuda_pipe_download(d0,doo,gout,sizeof(gout))||
+           !coli_cuda_pipe_download(d0,drs,gstate,sizeof(gstate))||
+           !coli_cuda_pipe_download(d0,dcs,gcstate,sizeof(gcstate)))return 1;
+        if(!close_enough(gout,want,2)||!close_enough(gstate,hrs,NV*D*D)||!close_enough(gcstate,hcs,CD*K))return 1;
+        coli_cuda_pipe_free(d0,dqkv);coli_cuda_pipe_free(d0,dz);coli_cuda_pipe_free(d0,dba);
+        coli_cuda_pipe_free(d0,dcw);coli_cuda_pipe_free(d0,ddt);coli_cuda_pipe_free(d0,da);
+        coli_cuda_pipe_free(d0,dnw);coli_cuda_pipe_free(d0,dcs);coli_cuda_pipe_free(d0,drs);coli_cuda_pipe_free(d0,doo);
     }
 
     /* Standard GQA decode keeps K/V and attention entirely on the device. */

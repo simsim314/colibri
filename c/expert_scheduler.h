@@ -100,6 +100,16 @@ void *coli_expert_promote_loaded(ColiExpertLayerStore *store, void *loaded_slot,
 int coli_expert_repin_pick(const ColiExpertLayerStore *store,
                            int *pin_index, int *candidate_eid, long *gain);
 
+/* Move an already cached REPIN candidate into a pinned slot without creating
+ * two slots that reference the same backend storage. The replaced pin is
+ * evicted and the former cache slot becomes empty. Returns 1 when moved, 0
+ * when the candidate is not in LRU, and -1 on an internal failure. */
+int coli_expert_repin_promote_cached(ColiExpertLayerStore *store,
+                                     int pin_index, int candidate_eid,
+                                     int layer,
+                                     const ColiExpertStorageOps *ops,
+                                     void *ctx);
+
 void coli_expert_decay_heat(ColiExpertLayerStore *store);
 
 /* Persistent expert-selection history. The text format is the existing Colibri

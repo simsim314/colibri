@@ -28,6 +28,11 @@ char *coli_gguf_tokenizer_format_granite_prompt(const ColiGgufTokenizer *tok,
                                                  const char *user_prompt);
 char *coli_granite_format_prompt(const char *user_prompt);
 
+/* Qwen3-Next single-user generation prompt. This matches the no-tools branch
+ * of the template embedded by current Qwen3-Next GGUF files. */
+char *coli_gguf_tokenizer_format_qwen3next_prompt(const ColiGgufTokenizer *tok,
+                                                   const char *user_prompt);
+
 #ifdef __cplusplus
 }
 #endif

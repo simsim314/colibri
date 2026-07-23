@@ -239,3 +239,23 @@ char *coli_gguf_tokenizer_format_granite_prompt(const ColiGgufTokenizer *gt,
 char *coli_granite_format_prompt(const char *user_prompt) {
     return format_granite_prompt(user_prompt, 1);
 }
+
+
+char *coli_gguf_tokenizer_format_qwen3next_prompt(const ColiGgufTokenizer *gt,
+                                                   const char *user_prompt) {
+    (void)gt;
+    static const char prefix[] = "<|im_start|>user\n";
+    static const char suffix[] = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    if (!user_prompt) return NULL;
+    const size_t n = strlen(user_prompt);
+    if (n > SIZE_MAX - sizeof(prefix) - sizeof(suffix)) return NULL;
+    const size_t total = (sizeof(prefix) - 1) + n + (sizeof(suffix) - 1);
+    char *out = (char *)malloc(total + 1);
+    if (!out) return NULL;
+    char *w = out;
+    memcpy(w, prefix, sizeof(prefix) - 1); w += sizeof(prefix) - 1;
+    memcpy(w, user_prompt, n); w += n;
+    memcpy(w, suffix, sizeof(suffix) - 1); w += sizeof(suffix) - 1;
+    *w = '\0';
+    return out;
+}

@@ -39,6 +39,13 @@ int main(void){
     int pin_index=-1,candidate=-1;long gain=0;
     assert(coli_expert_repin_pick(&st,&pin_index,&candidate,&gain));
     assert(pin_index==0&&candidate==6&&gain>0);
+    /* A cached REPIN candidate must move, not be duplicated across pin/LRU. */
+    pin[0]=(Slot){1,10,1};cache[0]=(Slot){6,60,30};cache[1]=(Slot){3,30,20};nc=2;
+    int ev0=ctx.evicts;
+    assert(coli_expert_repin_promote_cached(&st,0,6,0,&ops,&ctx)==1);
+    assert(pin[0].eid==6&&pin[0].payload==60);
+    assert(cache[0].eid==-1&&cache[0].payload==0&&ctx.evicts==ev0+1);
+    assert(coli_expert_lookup(&st,6,0).from_pin==1);
 
     {
         const char *path="tmp_expert_usage.txt";

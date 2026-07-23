@@ -1,4 +1,5 @@
 #include "gguf_granite.h"
+#include "gguf_qwen3next.h"
 #include "tensor.h"
 #include "gguf_tokenizer.h"
 #include "f32_kernels.h"
@@ -490,6 +491,12 @@ static void granite_repin(GraniteModel*m){
         ColiExpertLayerStore st=granite_store(m,l);int pi,e;long gain;
         if(!coli_expert_repin_pick(&st,&pi,&e,&gain))continue;
         GraniteExpertSlot*q=&m->layers[l].pin[pi];const int old=q->eid;
+        int moved=coli_expert_repin_promote_cached(&st,pi,e,l,&g_granite_storage,m);
+        if(moved>0){
+            if(m->verbose)fprintf(stderr,"[REPIN] GGUF layer %d: %d <- cached %d (gain %ld)\n",l,old,e,gain);
+            coli_expert_decay_heat(&st);continue;
+        }
+        if(moved<0)continue;
         granite_storage_evict(m,l,q);
         if(granite_storage_load(m,l,e,q,0)){
             q->used=++m->expert_clock;
@@ -763,6 +770,18 @@ int coli_gguf_run_cli(int argc,char**argv){
         else {fprintf(stderr,"unknown GGUF option: %s\n",argv[i]);usage(argv[0]);return 2;}
     }
     if(!model_path||!prompt||max_tokens<0){usage(argv[0]);return 2;}
+    /* Architecture dispatch stays in the single GGUF CLI entry point. */
+    {
+        ColiGgufFile arch_probe; arch_probe.fd=-1;
+        if(coli_gguf_open(&arch_probe,model_path)){
+            const ColiGgufKV *akv=coli_gguf_find_kv(&arch_probe,"general.architecture");
+            char *arch=NULL;
+            if(akv&&coli_gguf_kv_read_string(&arch_probe,akv,&arch)&&!strcmp(arch,"qwen3next")){
+                free(arch);coli_gguf_close(&arch_probe);return coli_qwen3next_run_cli(argc,argv);
+            }
+            free(arch);coli_gguf_close(&arch_probe);
+        }
+    }
     /* Open metadata/tokenizer first so prompt formatting follows the template embedded in this GGUF. */
     ColiGgufFile probe;probe.fd=-1;ColiGgufTokenizer*pt=NULL;char err[512];
     if(!coli_gguf_open(&probe,model_path)||!coli_gguf_tokenizer_load(&pt,&probe,err,sizeof(err))){
