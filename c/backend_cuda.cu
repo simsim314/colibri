@@ -3,6 +3,8 @@
 #include "backend_gpu_compat.h"
 
 #include <cstdio>
+#include <climits>
+#include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -23,6 +25,10 @@ struct ColiCudaTensor {
     float *scales;
     size_t weight_bytes;
     int fmt, I, O, device;
+    uint32_t ggml_type;
+    size_t native_row_bytes;
+    int native_ggml;
+    int owns_weights;
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
     size_t scale_count;        /* floats in `scales`: O per-row, O*ng grouped */
@@ -36,6 +42,7 @@ typedef struct {
     int compute_major,compute_minor;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    void *ggml_w; size_t ggml_w_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
@@ -158,6 +165,83 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
     }
     if (!threadIdx.x)
         y[(size_t)s * O + o] = (fmt && fmt != 4) ? partial[0] * scales[o] : partial[0];
+}
+
+
+__host__ __device__ static size_t ggml_row_bytes(uint32_t type, int I) {
+    if (I < 1) return 0;
+    if (type == 0) return (size_t)I * 4;
+    if (type == 1) return (size_t)I * 2;
+    if ((type == 12 || type == 13 || type == 14) && (I % 256) == 0) {
+        size_t bs = type == 12 ? 144 : (type == 13 ? 176 : 210);
+        return (size_t)(I / 256) * bs;
+    }
+    return 0;
+}
+
+__device__ static uint16_t ggml_u16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+__device__ static uint32_t ggml_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+__device__ static float ggml_f32(const uint8_t *p) { return __uint_as_float(ggml_u32(p)); }
+__device__ static float ggml_f16(const uint8_t *p) {
+    uint16_t h=ggml_u16(p); uint32_t sign=(uint32_t)(h&0x8000u)<<16;
+    uint32_t e=(h>>10)&31u,m=h&1023u,out;
+    if(!e){
+        if(!m) out=sign;
+        else { int sh=0; while(!(m&0x400u)){m<<=1;sh++;} m&=1023u;
+               out=sign|((uint32_t)(127-14-sh)<<23)|(m<<13); }
+    } else if(e==31) out=sign|0x7f800000u|(m<<13);
+    else out=sign|((e+112u)<<23)|(m<<13);
+    return __uint_as_float(out);
+}
+__device__ static void ggml_scale_min(int j,const uint8_t *q,int *sc,int *mn){
+    if(j<4){*sc=q[j]&63;*mn=q[j+4]&63;}
+    else {*sc=(q[j+4]&15)|((q[j-4]>>6)<<4);*mn=(q[j+4]>>4)|((q[j]>>6)<<4);}
+}
+__device__ static float ggml_weight(const uint8_t *row,uint32_t type,int i){
+    if(type==0) return ggml_f32(row+(size_t)i*4);
+    if(type==1) return ggml_f16(row+(size_t)i*2);
+    int bi=i>>8,j=i&255;
+    if(type==12){
+        const uint8_t *p=row+(size_t)bi*144; float d=ggml_f16(p),dm=ggml_f16(p+2);
+        const uint8_t *scales=p+4,*q=p+16; int c=j>>6,k=j&63,sc,mn;
+        ggml_scale_min(2*c+(k>=32),scales,&sc,&mn);
+        uint8_t v=q[c*32+(k&31)]; int qv=k<32?(v&15):(v>>4);
+        return d*sc*qv-dm*mn;
+    }
+    if(type==13){
+        const uint8_t *p=row+(size_t)bi*176; float d=ggml_f16(p),dm=ggml_f16(p+2);
+        const uint8_t *scales=p+4,*qh=p+16,*ql=p+48; int c=j>>6,k=j&63,sc,mn;
+        ggml_scale_min(2*c+(k>=32),scales,&sc,&mn);
+        uint8_t v=ql[c*32+(k&31)]; int qv=k<32?(v&15):(v>>4);
+        uint8_t mask=(uint8_t)((k<32?1:2)<<(2*c)); if(qh[k&31]&mask) qv+=16;
+        return d*sc*qv-dm*mn;
+    }
+    if(type==14){
+        const uint8_t *p=row+(size_t)bi*210,*ql=p,*qh=p+128; const int8_t *sc=(const int8_t*)(p+192);
+        float d=ggml_f16(p+208); int half=j>>7,r=j&127,l=r&31,is=l>>4,qv,si;
+        const uint8_t *qlh=ql+half*64,*qhh=qh+half*32; const int8_t *sch=sc+half*8;
+        if(r<32){qv=((qlh[l]&15)|(((qhh[l]>>0)&3)<<4))-32;si=is;}
+        else if(r<64){qv=((qlh[l+32]&15)|(((qhh[l]>>2)&3)<<4))-32;si=is+2;}
+        else if(r<96){qv=((qlh[l]>>4)|(((qhh[l]>>4)&3)<<4))-32;si=is+4;}
+        else {qv=((qlh[l+32]>>4)|(((qhh[l]>>6)&3)<<4))-32;si=is+6;}
+        return d*sch[si]*qv;
+    }
+    return 0.f;
+}
+
+__global__ static void ggml_quant_matmul(float *y,const float *x,const uint8_t *w,
+                                         uint32_t type,int S,int I,int O,size_t rb){
+    int o=blockIdx.x,s=blockIdx.y; const uint8_t *row=w+(size_t)o*rb;
+    const float *xs=x+(size_t)s*I; float sum=0.f;
+    for(int i=threadIdx.x;i<I;i+=blockDim.x) sum+=xs[i]*ggml_weight(row,type,i);
+    __shared__ float sh[256]; sh[threadIdx.x]=sum; __syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(threadIdx.x<n)sh[threadIdx.x]+=sh[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)s*O+o]=sh[0];
 }
 
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
@@ -540,6 +624,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->gate) cudaFree(ctx->gate);
         if (ctx->up) cudaFree(ctx->up);
+        if (ctx->ggml_w) cudaFree(ctx->ggml_w);
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
@@ -550,6 +635,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
+        ctx->ggml_w=nullptr; ctx->ggml_w_cap=0;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->host_x=ctx->host_y=ctx->host_kv=nullptr;ctx->stream=nullptr;
@@ -619,6 +705,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
+    t->owns_weights = 1;
     t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
     t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
     t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
@@ -706,6 +793,89 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
+}
+
+
+extern "C" int coli_cuda_ggml_matmul(float *y,const float *x,
+                                      const void *weights,uint32_t dtype,
+                                      uint64_t weight_bytes,int S,int I,int O,int device){
+    if(fault_injected()||!y||!x||!weights||S<1||I<1||O<1) return 0;
+    size_t rb=ggml_row_bytes(dtype,I);
+    if(!rb || (uint64_t)rb*(uint64_t)O!=weight_bytes || weight_bytes>SIZE_MAX) return 0;
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    size_t xb=(size_t)S*(size_t)I*sizeof(float),yb=(size_t)S*(size_t)O*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb)||
+       !reserve_bytes(&ctx->ggml_w,&ctx->ggml_w_cap,(size_t)weight_bytes)) return 0;
+    if(!cuda_ok(cudaMemcpy(ctx->ggml_w,weights,(size_t)weight_bytes,cudaMemcpyHostToDevice),
+                "GGUF quantized weight upload")||
+       !cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"GGUF input upload")) return 0;
+    dim3 grid((unsigned)O,(unsigned)S);
+    ggml_quant_matmul<<<grid,256>>>(ctx->y,ctx->x,(const uint8_t*)ctx->ggml_w,dtype,S,I,O,rb);
+    if(!cuda_ok(cudaGetLastError(),"GGUF quantized matmul")||
+       !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"GGUF output download")) return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_tensor_upload_ggml(ColiCudaTensor **tensor,
+        const void *weights,uint32_t dtype,uint64_t weight_bytes,int I,int O,int device){
+    if(!tensor) return 0;
+    if(*tensor){
+        ColiCudaTensor *t=*tensor;
+        return t->native_ggml&&t->ggml_type==dtype&&t->I==I&&t->O==O&&
+               t->device==device&&t->weight_bytes==(size_t)weight_bytes;
+    }
+    if(!weights||I<1||O<1||weight_bytes>SIZE_MAX) return 0;
+    size_t rb=ggml_row_bytes(dtype,I);
+    if(!rb||(uint64_t)rb*(uint64_t)O!=weight_bytes) return 0;
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t)); if(!t) return 0;
+    t->I=I;t->O=O;t->device=device;t->ggml_type=dtype;t->native_row_bytes=rb;
+    t->native_ggml=1;t->owns_weights=1;t->weight_bytes=(size_t)weight_bytes;
+    if(!cuda_ok(cudaMalloc(&t->weights,t->weight_bytes),"native tensor allocation")||
+       !cuda_ok(cudaMemcpy(t->weights,weights,t->weight_bytes,cudaMemcpyHostToDevice),
+                "native encoded tensor upload")){
+        coli_cuda_tensor_free(t);return 0;
+    }
+    t->tracked=1;ctx->tensor_count++;ctx->tensor_bytes+=t->weight_bytes;
+    *tensor=t;return 1;
+}
+
+extern "C" int coli_cuda_tensor_view_rows(ColiCudaTensor *base,
+        uint64_t first_row,uint64_t row_count,ColiCudaTensor **view){
+    if(!base||!view||*view||!base->native_ggml||!row_count||
+       first_row>(uint64_t)base->O||row_count>(uint64_t)base->O-first_row||
+       row_count>(uint64_t)INT_MAX) return 0;
+    if(first_row>SIZE_MAX/base->native_row_bytes) return 0;
+    size_t off=(size_t)first_row*base->native_row_bytes;
+    if(row_count>SIZE_MAX/base->native_row_bytes) return 0;
+    size_t bytes=(size_t)row_count*base->native_row_bytes;
+    if(off>base->weight_bytes||bytes>base->weight_bytes-off) return 0;
+    ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t));if(!t)return 0;
+    *t=*base;t->weights=(uint8_t*)base->weights+off;t->O=(int)row_count;
+    t->weight_bytes=bytes;t->owns_weights=0;t->tracked=0;t->scales=nullptr;
+    t->ragged_count=0;*view=t;return 1;
+}
+
+extern "C" const void *coli_cuda_tensor_data(const ColiCudaTensor *tensor){
+    return tensor?tensor->weights:nullptr;
+}
+
+extern "C" int coli_cuda_tensor_matmul_host(ColiCudaTensor *t,float *y,
+        const float *x,int S){
+    if(fault_injected()||!t||!y||!x||S<1) return 0;
+    DeviceContext *ctx=find_ctx(t->device);if(!select_ctx(ctx))return 0;
+    size_t xb=(size_t)S*t->I*sizeof(float),yb=(size_t)S*t->O*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb))return 0;
+    if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"resident input upload"))return 0;
+    dim3 grid((unsigned)t->O,(unsigned)S);
+    if(t->native_ggml)
+        ggml_quant_matmul<<<grid,256>>>(ctx->y,ctx->x,(const uint8_t*)t->weights,
+            t->ggml_type,S,t->I,t->O,t->native_row_bytes);
+    else
+        quant_matmul<<<grid,256>>>(ctx->y,ctx->x,t->weights,t->scales,t->fmt,S,t->I,t->O,
+            row_bytes(t->fmt,t->I),t->gs,t->ng);
+    return cuda_ok(cudaGetLastError(),"resident matmul launch")&&
+           cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"resident output download");
 }
 
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
@@ -1150,12 +1320,12 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
         int ng = tensor->ng > 0 ? tensor->ng : 1;
-        size_t bytes = tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+        size_t bytes = tensor->weight_bytes + (!tensor->native_ggml && tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
-    if (tensor->weights) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->weights && tensor->owns_weights) cudaFree(tensor->weights);
+    if (tensor->scales && tensor->owns_weights) cudaFree(tensor->scales);
     for(int i=0;i<tensor->ragged_count;i++){
         if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
         if(tensor->ragged[i].rope)cudaFree(tensor->ragged[i].rope);
@@ -1165,6 +1335,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
+    if(tensor->native_ggml) return tensor->weight_bytes;
     int ng = tensor->ng > 0 ? tensor->ng : 1;
     return tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
 }
@@ -1208,9 +1379,67 @@ __global__ static void pipe_rope_rows(float *v,const int *pos,int pos_base,int s
     }
 }
 
+__global__ static void pipe_rope_interleaved_kernel(float *v,int position,int head_dim,
+        int rope_dims,float theta){
+    int h=blockIdx.x;float *head=v+(size_t)h*head_dim;
+    for(int i=threadIdx.x*2;i<rope_dims;i+=blockDim.x*2){
+        float ang=position*__powf(theta,-(float)i/rope_dims),cs=__cosf(ang),sn=__sinf(ang);
+        float a=head[i],b=head[i+1];head[i]=a*cs-b*sn;head[i+1]=a*sn+b*cs;
+    }
+}
+
 __global__ static void pipe_add_n(float *x,const float *t,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n) x[i]+=t[i];
+}
+
+__global__ static void pipe_axpy_n(float *y,const float *x,float alpha,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) y[i]+=alpha*x[i];
+}
+__global__ static void pipe_zero_n(float *x,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)x[i]=0.f;
+}
+__global__ static void pipe_residual_n(float *y,const float *base,const float *delta,float alpha,size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)y[i]=base[i]+alpha*delta[i];
+}
+__global__ static void ggml_decode_row_kernel(float *out,const uint8_t *w,uint32_t type,
+        size_t rb,uint64_t row,int I,float scale){
+    const uint8_t *src=w+(size_t)row*rb;
+    for(int i=threadIdx.x+(int)blockIdx.x*blockDim.x;i<I;i+=blockDim.x*gridDim.x)
+        out[i]=ggml_weight(src,type,i)*scale;
+}
+__global__ static void gqa_store_kv(float *kc,float *vc,const float *k,const float *v,
+        int pos,int kv_dim){
+    int i=(int)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<kv_dim){kc[(size_t)pos*kv_dim+i]=k[i];vc[(size_t)pos*kv_dim+i]=v[i];}
+}
+__global__ static void gqa_scores(float *scores,const float *q,const float *kc,int pos,
+        int H,int HK,int D,int kv_dim,float scale){
+    int h=blockIdx.x,kh=h/(H/HK),T=pos+1;float local=-FLT_MAX;
+    const float *qh=q+(size_t)h*D;
+    for(int t=threadIdx.x;t<T;t+=blockDim.x){
+        const float *kt=kc+(size_t)t*kv_dim+(size_t)kh*D;float z=0.f;
+        for(int d=0;d<D;d++)z+=qh[d]*kt[d];z*=scale;
+        scores[(size_t)h*T+t]=z;local=fmaxf(local,z);
+    }
+    __shared__ float sh[256];sh[threadIdx.x]=local;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)sh[threadIdx.x]=fmaxf(sh[threadIdx.x],sh[threadIdx.x+n]);__syncthreads();}
+    float mx=sh[0],sum=0.f;
+    for(int t=threadIdx.x;t<T;t+=blockDim.x){float e=expf(scores[(size_t)h*T+t]-mx);scores[(size_t)h*T+t]=e;sum+=e;}
+    sh[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)sh[threadIdx.x]+=sh[threadIdx.x+n];__syncthreads();}
+    float inv=1.f/sh[0];for(int t=threadIdx.x;t<T;t+=blockDim.x)scores[(size_t)h*T+t]*=inv;
+}
+__global__ static void gqa_values(float *out,const float *scores,const float *vc,int pos,
+        int H,int HK,int D,int kv_dim){
+    int h=blockIdx.x,kh=h/(H/HK),T=pos+1;
+    for(int d=threadIdx.x;d<D;d+=blockDim.x){float z=0.f;
+        for(int t=0;t<T;t++)z+=scores[(size_t)h*T+t]*vc[(size_t)t*kv_dim+(size_t)kh*D+d];
+        out[(size_t)h*D+d]=z;
+    }
 }
 
 /* Fixed-order partial merge: block b adds partial row b into x row rows[b].
@@ -1282,6 +1511,14 @@ extern "C" int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int
     if(rows<1||R<2||R>256||heads<1||!select_ctx(ctx)) return 0;
     pipe_rope_rows<<<rows,128>>>(v_dev,NULL,pos_base,stride,offset,R,heads,theta);
     return cuda_ok(cudaGetLastError(),"pipe rope base");
+}
+extern "C" int coli_cuda_pipe_rope_interleaved(int device,float *v_dev,int position,
+        int n_heads,int head_dim,int rope_dims,float theta){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!v_dev||position<0||n_heads<1||head_dim<2||rope_dims<2||rope_dims>head_dim||
+       (rope_dims&1)||!select_ctx(ctx))return 0;
+    pipe_rope_interleaved_kernel<<<n_heads,128>>>(v_dev,position,head_dim,rope_dims,theta);
+    return cuda_ok(cudaGetLastError(),"pipe interleaved rope");
 }
 /* ---- device router (#431 PR-A) -------------------------------------------
  * Router for one decode row, entirely on the layer's home device: logits GEMV
@@ -1505,6 +1742,42 @@ extern "C" int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,siz
     pipe_add_n<<<(unsigned)((n+255)/256),256>>>(x_dev,t_dev,n);
     return cuda_ok(cudaGetLastError(),"pipe add");
 }
+extern "C" int coli_cuda_pipe_axpy(int device,float *y_dev,const float *x_dev,float alpha,size_t n){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);if(!n||!select_ctx(ctx))return 0;
+    pipe_axpy_n<<<(unsigned)((n+255)/256),256>>>(y_dev,x_dev,alpha,n);
+    return cuda_ok(cudaGetLastError(),"pipe axpy");
+}
+extern "C" int coli_cuda_pipe_zero(int device,float *x_dev,size_t n){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);if(!n||!select_ctx(ctx))return 0;
+    pipe_zero_n<<<(unsigned)((n+255)/256),256>>>(x_dev,n);
+    return cuda_ok(cudaGetLastError(),"pipe zero");
+}
+extern "C" int coli_cuda_pipe_residual(int device,float *y_dev,const float *base_dev,
+        const float *delta_dev,float alpha,size_t n){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!y_dev||!base_dev||!delta_dev||!n||!select_ctx(ctx))return 0;
+    pipe_residual_n<<<(unsigned)((n+255)/256),256>>>(y_dev,base_dev,delta_dev,alpha,n);
+    return cuda_ok(cudaGetLastError(),"pipe residual");
+}
+extern "C" int coli_cuda_pipe_decode_row(ColiCudaTensor *t,uint64_t row,float *out_dev,float scale){
+    if(fault_injected()||!t||!t->native_ggml||!out_dev||row>=(uint64_t)t->O)return 0;
+    DeviceContext *ctx=find_ctx(t->device);if(!select_ctx(ctx))return 0;
+    int blocks=(t->I+255)/256;if(blocks>64)blocks=64;
+    ggml_decode_row_kernel<<<blocks,256>>>(out_dev,(const uint8_t*)t->weights,t->ggml_type,
+        t->native_row_bytes,row,t->I,scale);
+    return cuda_ok(cudaGetLastError(),"native row decode");
+}
+extern "C" int coli_cuda_pipe_gqa_decode(int device,float *out_dev,const float *q_dev,
+        const float *k_dev,const float *v_dev,float *kc,float *vc,float *scores,
+        int pos,int context_capacity,int H,int HK,int D,float scale){
+    if(fault_injected()||!out_dev||!q_dev||!k_dev||!v_dev||!kc||!vc||!scores||
+       pos<0||pos>=context_capacity||H<1||HK<1||H%HK||D<1||D>256)return 0;
+    DeviceContext *ctx=find_ctx(device);if(!select_ctx(ctx))return 0;int kv=HK*D;
+    gqa_store_kv<<<(unsigned)((kv+255)/256),256>>>(kc,vc,k_dev,v_dev,pos,kv);
+    gqa_scores<<<H,256>>>(scores,q_dev,kc,pos,H,HK,D,kv,scale);
+    gqa_values<<<H,256>>>(out_dev,scores,vc,pos,H,HK,D,kv);
+    return cuda_ok(cudaGetLastError(),"GQA decode");
+}
 extern "C" int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
                                        const int *rows_dev,int nrows,int D){
     if (fault_injected()) return 0;
@@ -1520,8 +1793,12 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
     dim3 grid((unsigned)t->O,(unsigned)S);
-    quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
-        row_bytes(t->fmt,t->I),t->gs,t->ng);
+    if(t->native_ggml)
+        ggml_quant_matmul<<<grid,256>>>(y_dev,x_dev,(const uint8_t*)t->weights,t->ggml_type,
+            S,t->I,t->O,t->native_row_bytes);
+    else
+        quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
+            row_bytes(t->fmt,t->I),t->gs,t->ng);
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */

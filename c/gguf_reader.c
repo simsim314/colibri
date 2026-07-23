@@ -11,6 +11,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
+#include <sys/mman.h>
+#endif
+
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
 #endif
@@ -68,10 +75,22 @@ static uint64_t load_u64_le(const unsigned char p[8]) {
            ((uint64_t)p[7] << 56);
 }
 
+const void *coli_gguf_mapped_at(const ColiGgufFile *g, uint64_t offset, uint64_t bytes) {
+    uint64_t end;
+    if (!g || !g->mapping || add_overflow_u64(offset, bytes, &end) ||
+        end > g->mapping_size || offset > SIZE_MAX) return NULL;
+    return (const unsigned char *)g->mapping + (size_t)offset;
+}
+
 int coli_gguf_read_at(const ColiGgufFile *g, uint64_t offset, void *dst, size_t bytes) {
     uint64_t end;
     if (!g || g->fd < 0 || (!dst && bytes)) return 0;
     if (add_overflow_u64(offset, (uint64_t)bytes, &end) || end > g->file_size) return 0;
+    const void *mapped = coli_gguf_mapped_at(g, offset, (uint64_t)bytes);
+    if (mapped) {
+        if (bytes) memcpy(dst, mapped, bytes);
+        return 1;
+    }
 
     size_t done = 0;
     while (done < bytes) {
@@ -454,6 +473,27 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
     }
     g->file_size = (uint64_t)st.st_size;
 
+    /* Map the file without copying it. The mapping reserves virtual address
+     * space only; physical pages are faulted from disk as kernels touch them. */
+    if (g->file_size && g->file_size <= SIZE_MAX) {
+#ifdef _WIN32
+        intptr_t osfh = _get_osfhandle(g->fd);
+        if (osfh != -1 && osfh != -2) {
+            HANDLE mh = CreateFileMappingA((HANDLE)osfh, NULL, PAGE_READONLY,
+                                           (DWORD)(g->file_size >> 32),
+                                           (DWORD)g->file_size, NULL);
+            if (mh) {
+                void *view = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+                if (view) { g->mapping = view; g->mapping_handle = mh; g->mapping_size = g->file_size; }
+                else CloseHandle(mh);
+            }
+        }
+#else
+        void *view = mmap(NULL, (size_t)g->file_size, PROT_READ, MAP_PRIVATE, g->fd, 0);
+        if (view != MAP_FAILED) { g->mapping = view; g->mapping_size = g->file_size; }
+#endif
+    }
+
     GgufCursor c = { g, 0 };
     unsigned char magic[4];
     if (!cursor_read(&c, magic, sizeof(magic))) goto fail;
@@ -575,6 +615,14 @@ void coli_gguf_close(ColiGgufFile *g) {
     free(g->metadata);
     free(g->tensors);
     free(g->path);
+    if (g->mapping) {
+#ifdef _WIN32
+        UnmapViewOfFile(g->mapping);
+        if (g->mapping_handle) CloseHandle((HANDLE)g->mapping_handle);
+#else
+        munmap(g->mapping, (size_t)g->mapping_size);
+#endif
+    }
     if (g->fd >= 0) close(g->fd);
 
     memset(g, 0, sizeof(*g));

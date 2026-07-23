@@ -193,9 +193,9 @@ static void deq_q8_k(const uint8_t *p, float *y) {
     for (int j = 0; j < 256; ++j) y[j] = d * q[j];
 }
 
-int coli_ggml_dequantize_row(uint32_t type, const void *encoded,
-                             uint64_t element_count, float *output) {
-    const ColiGgmlTypeTraits *t = coli_ggml_type_traits(type);
+int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
+                              uint64_t element_count, float *output) {
+    const ColiDTypeTraits *t = coli_dtype_traits(type);
     if (!t || !encoded || !output || element_count % t->block_values) return 0;
     const uint8_t *p = (const uint8_t *)encoded;
     uint64_t blocks = element_count / t->block_values;
@@ -224,4 +224,26 @@ int coli_ggml_dequantize_row(uint32_t type, const void *encoded,
         p += t->block_bytes;
     }
     return 1;
+}
+
+float coli_dtype_dot_f32(ColiDType type, const void *encoded,
+                         const float *x, uint64_t element_count) {
+    const ColiDTypeTraits *t = coli_dtype_traits(type);
+    if (!t || !encoded || !x || element_count % t->block_values) return 0.0f;
+    const uint8_t *p = (const uint8_t *)encoded;
+    float decoded[256];
+    double sum = 0.0;
+    uint64_t blocks = element_count / t->block_values;
+    for (uint64_t b = 0; b < blocks; ++b) {
+        if (!coli_dtype_dequantize_row(type, p, t->block_values, decoded)) return 0.0f;
+        const float *xb = x + b * t->block_values;
+        for (uint32_t i = 0; i < t->block_values; ++i) sum += (double)xb[i] * decoded[i];
+        p += t->block_bytes;
+    }
+    return (float)sum;
+}
+
+int coli_ggml_dequantize_row(uint32_t type, const void *encoded,
+                             uint64_t element_count, float *output) {
+    return coli_dtype_dequantize_row((ColiDType)type, encoded, element_count, output);
 }

@@ -23,7 +23,7 @@ FILES = [
     "tests/test_gguf_reader", "tests/test_gguf_reader.exe",
     "tests/test_ggml_types", "tests/test_ggml_types.exe",
     "tests/test_ggml_quants", "tests/test_ggml_quants.exe",
-    "tests/test_gguf_f32_loader", "tests/test_gguf_f32_loader.exe",
+    "tests/test_tensor", "tests/test_tensor.exe",
     "tests/test_f32_kernels", "tests/test_f32_kernels.exe",
     "tests/test_gguf_tokenizer", "tests/test_gguf_tokenizer.exe",
     "tests/test_gguf_granite", "tests/test_gguf_granite.exe",

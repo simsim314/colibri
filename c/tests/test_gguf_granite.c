@@ -1,5 +1,5 @@
-/* Tiny end-to-end Granite-MoE GGUF: metadata -> tokenizer -> F32 tensor loader
- * -> GQA/MoE forward -> tied output logits. */
+/* Tiny end-to-end Granite-MoE GGUF: metadata -> mmap-native tensors
+ * -> CPU GQA/MoE forward -> tied output logits. */
 #include "../gguf_granite.c"
 
 #include <assert.h>
@@ -86,7 +86,8 @@ int main(void) {
 #endif
     write_fixture(path);
     GraniteModel m;GraniteScratch s={0};char err[512];
-    assert(load_model(&m,path,2,0,err,sizeof(err)));
+    ColiExec exec={COLI_BACKEND_CPU,0};
+    assert(load_model(&m,path,2,0,exec,err,sizeof(err)));
     assert(scratch_alloc(&m,&s,err,sizeof(err)));
     assert(model_forward(&m,&s,1,0,err,sizeof(err)));
     assert(argmax(s.logits,m.vocab)==1); /* A remains the greedy tied-embedding token. */

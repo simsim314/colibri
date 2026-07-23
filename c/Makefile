@@ -162,6 +162,9 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_90,code=sm_90 \
                -gencode arch=compute_120,code=sm_120 \
                -gencode arch=compute_120,code=compute_120
+else ifeq ($(filter sm_% compute_% native,$(CUDA_ARCH)),)
+# Accept the short CUDA_ARCH=61 form as well as CUDA_ARCH=sm_61.
+CUDA_GENCODE = -arch=sm_$(CUDA_ARCH)
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
@@ -200,7 +203,7 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_gguf_reader$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
-TEST_BINS += tests/test_ggml_types$(EXE) tests/test_ggml_quants$(EXE) tests/test_gguf_f32_loader$(EXE) tests/test_f32_kernels$(EXE) tests/test_gguf_tokenizer$(EXE) tests/test_gguf_granite$(EXE)
+TEST_BINS += tests/test_ggml_types$(EXE) tests/test_ggml_quants$(EXE) tests/test_tensor$(EXE) tests/test_f32_kernels$(EXE) tests/test_gguf_tokenizer$(EXE) tests/test_gguf_granite$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -256,8 +259,8 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-GGUF_RUNTIME_SRC = gguf_granite.c gguf_tokenizer.c gguf_f32_loader.c ggml_quants.c ggml_types.c gguf_reader.c
-GGUF_RUNTIME_HDR = gguf_granite.h gguf_tokenizer.h gguf_f32_loader.h ggml_quants.h ggml_types.h gguf_reader.h f32_kernels.h
+GGUF_RUNTIME_SRC = gguf_granite.c gguf_tokenizer.c tensor.c ggml_quants.c ggml_types.c gguf_reader.c
+GGUF_RUNTIME_HDR = gguf_granite.h gguf_tokenizer.h tensor.h ggml_quants.h ggml_types.h gguf_reader.h f32_kernels.h
 
 all: colibri$(EXE)
 
@@ -288,8 +291,8 @@ endif
 colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR) $(CUDA_OBJ) $(METAL_OBJ) .build-config
 	$(CC) $(CFLAGS) colibri.c $(GGUF_RUNTIME_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
-run-f32-gguf$(EXE): run_f32_gguf.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR) .build-config
-	$(CC) $(CFLAGS) run_f32_gguf.c $(GGUF_RUNTIME_SRC) -o $@ $(LDFLAGS)
+run-f32-gguf$(EXE): run_f32_gguf.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR) $(CUDA_OBJ) .build-config
+	$(CC) $(CFLAGS) run_f32_gguf.c $(GGUF_RUNTIME_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 ifneq ($(EXE),)
 run-f32-gguf: run-f32-gguf$(EXE)
@@ -378,8 +381,8 @@ tests/test_ggml_types$(EXE): tests/test_ggml_types.c ggml_types.c ggml_types.h
 tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
 	$(CC) $(CFLAGS) tests/test_ggml_quants.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
 
-tests/test_gguf_f32_loader$(EXE): tests/test_gguf_f32_loader.c gguf_f32_loader.c gguf_f32_loader.h gguf_reader.c gguf_reader.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
-	$(CC) $(CFLAGS) tests/test_gguf_f32_loader.c gguf_f32_loader.c gguf_reader.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
+tests/test_tensor$(EXE): tests/test_tensor.c tensor.c tensor.h gguf_reader.c gguf_reader.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
+	$(CC) $(CFLAGS) tests/test_tensor.c tensor.c gguf_reader.c ggml_quants.c ggml_types.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_f32_kernels$(EXE): tests/test_f32_kernels.c f32_kernels.h
 	$(CC) $(CFLAGS) tests/test_f32_kernels.c -o $@ $(LDFLAGS)
@@ -388,7 +391,7 @@ tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gg
 	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c -o $@ $(LDFLAGS)
 
 tests/test_gguf_granite$(EXE): tests/test_gguf_granite.c gguf_granite.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_tokenizer.c gguf_f32_loader.c ggml_quants.c ggml_types.c gguf_reader.c -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_tokenizer.c tensor.c ggml_quants.c ggml_types.c gguf_reader.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

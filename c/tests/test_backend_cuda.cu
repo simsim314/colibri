@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef _WIN32
 /* MSVC has no POSIX setenv/unsetenv */
@@ -41,6 +42,82 @@ int main(int argc, char **argv) {
     if (count || bytes) return 1;
     const float x[8] = {1, -2, 3, -4, 2, 1, -1, 0.5f};
     float got[4];
+
+    /* Native GGUF dtype parity: encoded K-quant blocks are uploaded as-is and
+     * dequantized inside the CUDA kernel. Each fixture decodes to 256 ones. */
+    {
+        float qx[256],qy[1]; for(int i=0;i<256;i++) qx[i]=1.f;
+        uint8_t q4k[144]={0},q5k[176]={0},q6k[210]={0};
+        auto put16=[](uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);};
+        auto scales=[](uint8_t*p){for(int i=0;i<4;i++)p[i]=1;for(int i=8;i<12;i++)p[i]=1;};
+        put16(q4k,0x3c00);scales(q4k+4);std::memset(q4k+16,0x11,128);
+        put16(q5k,0x3c00);scales(q5k+4);std::memset(q5k+48,0x11,128);
+        std::memset(q6k,0x11,128);std::memset(q6k+128,0xaa,64);
+        std::memset(q6k+192,1,16);put16(q6k+208,0x3c00);
+        if(!coli_cuda_ggml_matmul(qy,qx,q4k,12,sizeof(q4k),1,256,1,d0)||
+           std::fabs(qy[0]-256.f)>1e-3f)return 1;
+        if(!coli_cuda_ggml_matmul(qy,qx,q5k,13,sizeof(q5k),1,256,1,d0)||
+           std::fabs(qy[0]-256.f)>1e-3f)return 1;
+        if(!coli_cuda_ggml_matmul(qy,qx,q6k,14,sizeof(q6k),1,256,1,d0)||
+           std::fabs(qy[0]-256.f)>1e-3f)return 1;
+        if(coli_cuda_ggml_matmul(qy,qx,q4k,12,sizeof(q4k)-1,1,256,1,d0))return 1;
+    }
+
+    /* Native resident tensor + zero-copy row view + device-resident pipeline. */
+    {
+        float qx[256];for(int i=0;i<256;i++)qx[i]=1.f;
+        uint8_t w[288]={0};
+        auto put16=[](uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);};
+        auto one=[](uint8_t*p){for(int i=0;i<4;i++)p[4+i]=1;for(int i=8;i<12;i++)p[4+i]=1;std::memset(p+16,0x11,128);};
+        put16(w,0x3c00);one(w);put16(w+144,0x3c00);one(w+144);
+        ColiCudaTensor *base=nullptr,*view=nullptr;
+        if(!coli_cuda_tensor_upload_ggml(&base,w,12,sizeof(w),256,2,d0)||
+           !coli_cuda_tensor_view_rows(base,1,1,&view))return 1;
+        float *dx=(float*)coli_cuda_pipe_alloc(d0,sizeof(qx));
+        float *dy=(float*)coli_cuda_pipe_alloc(d0,2*sizeof(float));
+        float *dr=(float*)coli_cuda_pipe_alloc(d0,256*sizeof(float));
+        if(!dx||!dy||!dr||!coli_cuda_pipe_upload(d0,dx,qx,sizeof(qx))||
+           !coli_cuda_pipe_gemm(base,dy,dx,1))return 1;
+        float out[2];if(!coli_cuda_pipe_download(d0,dy,out,sizeof(out))||
+           std::fabs(out[0]-256.f)>1e-3f||std::fabs(out[1]-256.f)>1e-3f)return 1;
+        if(!coli_cuda_pipe_gemm(view,dy,dx,1)||!coli_cuda_pipe_download(d0,dy,out,sizeof(float))||
+           std::fabs(out[0]-256.f)>1e-3f)return 1;
+        if(!coli_cuda_pipe_decode_row(base,1,dr,2.f))return 1;
+        float decoded[256];if(!coli_cuda_pipe_download(d0,dr,decoded,sizeof(decoded)))return 1;
+        for(int i=0;i<256;i++)if(std::fabs(decoded[i]-2.f)>1e-5f)return 1;
+        if(!coli_cuda_pipe_zero(d0,dr,256)||!coli_cuda_pipe_axpy(d0,dr,dx,3.f,256)||
+           !coli_cuda_pipe_download(d0,dr,decoded,sizeof(decoded)))return 1;
+        for(int i=0;i<256;i++)if(std::fabs(decoded[i]-3.f)>1e-5f)return 1;
+        coli_cuda_pipe_free(d0,dx);coli_cuda_pipe_free(d0,dy);coli_cuda_pipe_free(d0,dr);
+        coli_cuda_tensor_free(view);coli_cuda_tensor_free(base);
+    }
+
+    /* Standard GQA decode keeps K/V and attention entirely on the device. */
+    {
+        const int H=2,HK=1,D=2,C=3;float q[4]={1,0,0,1},k0[2]={1,0},v0[2]={2,3};
+        float *dq=(float*)coli_cuda_pipe_alloc(d0,sizeof(q));
+        float *dk=(float*)coli_cuda_pipe_alloc(d0,sizeof(k0));
+        float *dv=(float*)coli_cuda_pipe_alloc(d0,sizeof(v0));
+        float *doo=(float*)coli_cuda_pipe_alloc(d0,4*sizeof(float));
+        float *kc=(float*)coli_cuda_pipe_alloc(d0,C*HK*D*sizeof(float));
+        float *vc=(float*)coli_cuda_pipe_alloc(d0,C*HK*D*sizeof(float));
+        float *sc=(float*)coli_cuda_pipe_alloc(d0,H*C*sizeof(float));
+        if(!dq||!dk||!dv||!doo||!kc||!vc||!sc||
+           !coli_cuda_pipe_upload(d0,dq,q,sizeof(q))||!coli_cuda_pipe_upload(d0,dk,k0,sizeof(k0))||
+           !coli_cuda_pipe_upload(d0,dv,v0,sizeof(v0))||
+           !coli_cuda_pipe_gqa_decode(d0,doo,dq,dk,dv,kc,vc,sc,0,C,H,HK,D,1.f))return 1;
+        float out[4];if(!coli_cuda_pipe_download(d0,doo,out,sizeof(out)))return 1;
+        const float want0[4]={2,3,2,3};if(!close_enough(out,want0,4))return 1;
+        float k1[2]={0,1},v1[2]={4,5};
+        if(!coli_cuda_pipe_upload(d0,dk,k1,sizeof(k1))||!coli_cuda_pipe_upload(d0,dv,v1,sizeof(v1))||
+           !coli_cuda_pipe_gqa_decode(d0,doo,dq,dk,dv,kc,vc,sc,1,C,H,HK,D,1.f)||
+           !coli_cuda_pipe_download(d0,doo,out,sizeof(out)))return 1;
+        float a=std::exp(1.f)/(std::exp(1.f)+1.f),b=1.f-a;
+        float want1[4]={a*2+b*4,a*3+b*5,b*2+a*4,b*3+a*5};
+        if(!close_enough(out,want1,4))return 1;
+        coli_cuda_pipe_free(d0,dq);coli_cuda_pipe_free(d0,dk);coli_cuda_pipe_free(d0,dv);
+        coli_cuda_pipe_free(d0,doo);coli_cuda_pipe_free(d0,kc);coli_cuda_pipe_free(d0,vc);coli_cuda_pipe_free(d0,sc);
+    }
 
     const int8_t q8[8] = {1, 2, 3, 4, -1, 2, -3, 4};
     const float s8[2] = {0.5f, 2.0f};
@@ -203,6 +280,6 @@ int main(int argc, char **argv) {
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
     coli_cuda_shutdown();
-    std::printf("cuda backend: q8/q4/q2/f32 correctness ok on %d device(s)\n", ndev);
+    std::printf("cuda backend: native GGUF K-quants + q8/q4/q2/f32 correctness ok on %d device(s)\n", ndev);
     return 0;
 }

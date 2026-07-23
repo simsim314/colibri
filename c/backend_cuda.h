@@ -55,6 +55,26 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device, int gs);
 
+/* Native Colibri/GGUF dtype matmul. `weights` points to encoded GGML rows
+ * (F32/F16/Q4_K/Q5_K/Q6_K in the first CUDA implementation). The encoded
+ * bytes are staged to reusable VRAM scratch and decoded inside the kernel; no
+ * persistent F32 weight copy is created. */
+COLI_CUDA_DLLEXPORT int coli_cuda_ggml_matmul(float *y, const float *x,
+                           const void *weights, uint32_t dtype,
+                           uint64_t weight_bytes, int S, int I, int O, int device);
+
+/* Native encoded GGML/GGUF tensor residency. The uploaded representation is
+ * byte-identical to the mmap-backed source; no F32 weight copy is created. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_ggml(ColiCudaTensor **tensor,
+                           const void *weights, uint32_t dtype,
+                           uint64_t weight_bytes, int I, int O, int device);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_view_rows(ColiCudaTensor *base,
+                           uint64_t first_row, uint64_t row_count,
+                           ColiCudaTensor **view);
+COLI_CUDA_DLLEXPORT const void *coli_cuda_tensor_data(const ColiCudaTensor *tensor);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_matmul_host(ColiCudaTensor *tensor,
+                           float *y, const float *x, int S);
+
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in
  * each direction instead of once per matrix. */
@@ -132,6 +152,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope(int device,float *v_dev,const int *p
                         int stride,int offset,int R,int heads,float theta);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *up_dev,size_t n);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_axpy(int device,float *y_dev,const float *x_dev,float alpha,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_residual(int device,float *y_dev,const float *base_dev,
+                           const float *delta_dev,float alpha,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_zero(int device,float *x_dev,size_t n);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_decode_row(ColiCudaTensor *tensor,uint64_t row,
+                           float *out_dev,float scale);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_gqa_decode(int device,float *out_dev,
+                           const float *q_dev,const float *k_dev,const float *v_dev,
+                           float *k_cache_dev,float *v_cache_dev,float *scores_dev,
+                           int pos,int context_capacity,int n_heads,int n_kv_heads,
+                           int head_dim,float attention_scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev,
                             const int *rows_dev,int nrows,int D);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
@@ -140,6 +171,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const f
                              int xstride,int ystride);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
                              int stride,int offset,int R,int heads,float theta);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_interleaved(int device,float *v_dev,int position,
+                             int n_heads,int head_dim,int rope_dims,float theta);
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gates,
         ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
         const float *weights, int count,

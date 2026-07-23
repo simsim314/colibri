@@ -55,6 +55,15 @@ typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
+typedef int            (*fn_ggml_matmul)(float *y, const float *x, const void *weights,
+                                         uint32_t dtype, uint64_t weight_bytes,
+                                         int S, int I, int O, int device);
+typedef int            (*fn_tensor_upload_ggml)(ColiCudaTensor **tensor,const void *weights,
+                                         uint32_t dtype,uint64_t weight_bytes,int I,int O,int device);
+typedef int            (*fn_tensor_view_rows)(ColiCudaTensor *base,uint64_t first_row,
+                                         uint64_t row_count,ColiCudaTensor **view);
+typedef const void *   (*fn_tensor_data)(const ColiCudaTensor *tensor);
+typedef int            (*fn_tensor_matmul_host)(ColiCudaTensor *tensor,float *y,const float *x,int S);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
@@ -74,6 +83,13 @@ typedef int (*fn_attention_project_ragged)(ColiCudaTensor *kv_b,ColiCudaTensor *
 typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
+typedef int (*fn_pipe_axpy)(int device,float *y_dev,const float *x_dev,float alpha,size_t n);
+typedef int (*fn_pipe_residual)(int device,float *y_dev,const float *base_dev,const float *delta_dev,float alpha,size_t n);
+typedef int (*fn_pipe_zero)(int device,float *x_dev,size_t n);
+typedef int (*fn_pipe_decode_row)(ColiCudaTensor *tensor,uint64_t row,float *out_dev,float scale);
+typedef int (*fn_pipe_gqa_decode)(int device,float *out_dev,const float *q_dev,const float *k_dev,
+        const float *v_dev,float *k_cache_dev,float *v_cache_dev,float *scores_dev,int pos,
+        int context_capacity,int n_heads,int n_kv_heads,int head_dim,float attention_scale);
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
@@ -87,6 +103,7 @@ typedef int (*fn_group_resident_take)(int home_device,const int *devices,int n_i
 typedef int (*fn_pipe_router)(int device,const float *x_dev,const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,float topp,int norm_topk,float routed_scale,int *idx_host,float *w_host,int *keff_host);
 typedef int (*fn_pipe_rope)(int device,float *v_dev,const int *pos_dev,int rows, int stride,int offset,int R,int heads,float theta);
 typedef int (*fn_pipe_rope_base)(int device,float *v_dev,int pos_base,int rows, int stride,int offset,int R,int heads,float theta);
+typedef int (*fn_pipe_rope_interleaved)(int device,float *v_dev,int position,int n_heads,int head_dim,int rope_dims,float theta);
 typedef int (*fn_pipe_rows_add)(int device,float *x_dev,const float *partial_dev, const int *rows_dev,int nrows,int D);
 typedef float * (*fn_pipe_scratch)(int device,int slot,size_t bytes);
 typedef int (*fn_pipe_silu_mul)(int device,float *gate_dev,const float *up_dev,size_t n);
@@ -115,6 +132,11 @@ static struct {
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
     fn_matmul          matmul;
+    fn_ggml_matmul     ggml_matmul;
+    fn_tensor_upload_ggml tensor_upload_ggml;
+    fn_tensor_view_rows tensor_view_rows;
+    fn_tensor_data tensor_data;
+    fn_tensor_matmul_host tensor_matmul_host;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
@@ -127,6 +149,11 @@ static struct {
     fn_attention_project_batch_dev attention_project_batch_dev;
     fn_attention_project_batch_dev_out attention_project_batch_dev_out;
     fn_pipe_add pipe_add;
+    fn_pipe_axpy pipe_axpy;
+    fn_pipe_residual pipe_residual;
+    fn_pipe_zero pipe_zero;
+    fn_pipe_decode_row pipe_decode_row;
+    fn_pipe_gqa_decode pipe_gqa_decode;
     fn_pipe_alloc pipe_alloc;
     fn_pipe_copy2d pipe_copy2d;
     fn_pipe_download pipe_download;
@@ -140,6 +167,7 @@ static struct {
     fn_pipe_router pipe_router;
     fn_pipe_rope pipe_rope;
     fn_pipe_rope_base pipe_rope_base;
+    fn_pipe_rope_interleaved pipe_rope_interleaved;
     fn_pipe_rows_add pipe_rows_add;
     fn_pipe_scratch pipe_scratch;
     fn_pipe_silu_mul pipe_silu_mul;
@@ -215,6 +243,11 @@ static int coli_cuda_load(void){
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
     RESOLVE(matmul,         fn_matmul)
+    RESOLVE(ggml_matmul,    fn_ggml_matmul)
+    RESOLVE(tensor_upload_ggml, fn_tensor_upload_ggml)
+    RESOLVE(tensor_view_rows, fn_tensor_view_rows)
+    RESOLVE(tensor_data, fn_tensor_data)
+    RESOLVE(tensor_matmul_host, fn_tensor_matmul_host)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     RESOLVE(tensor_device,  fn_tensor_device)
@@ -227,6 +260,11 @@ static int coli_cuda_load(void){
     RESOLVE(attention_project_batch_dev, fn_attention_project_batch_dev)
     RESOLVE(attention_project_batch_dev_out, fn_attention_project_batch_dev_out)
     RESOLVE(pipe_add, fn_pipe_add)
+    RESOLVE(pipe_axpy, fn_pipe_axpy)
+    RESOLVE(pipe_residual, fn_pipe_residual)
+    RESOLVE(pipe_zero, fn_pipe_zero)
+    RESOLVE(pipe_decode_row, fn_pipe_decode_row)
+    RESOLVE(pipe_gqa_decode, fn_pipe_gqa_decode)
     RESOLVE(pipe_alloc, fn_pipe_alloc)
     RESOLVE(pipe_copy2d, fn_pipe_copy2d)
     RESOLVE(pipe_download, fn_pipe_download)
@@ -240,6 +278,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_router, fn_pipe_router)
     RESOLVE(pipe_rope, fn_pipe_rope)
     RESOLVE(pipe_rope_base, fn_pipe_rope_base)
+    RESOLVE(pipe_rope_interleaved, fn_pipe_rope_interleaved)
     RESOLVE(pipe_rows_add, fn_pipe_rows_add)
     RESOLVE(pipe_scratch, fn_pipe_scratch)
     RESOLVE(pipe_silu_mul, fn_pipe_silu_mul)
@@ -348,6 +387,13 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
 }
 
+int coli_cuda_ggml_matmul(float *y,const float *x,const void *weights,
+                          uint32_t dtype,uint64_t weight_bytes,
+                          int S,int I,int O,int device){
+    if(!g_cuda.available || !g_cuda.ggml_matmul) return 0;
+    return g_cuda.ggml_matmul(y,x,weights,dtype,weight_bytes,S,I,O,device);
+}
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){
     if(g_cuda.available && g_cuda.tensor_free) g_cuda.tensor_free(tensor);
 }
@@ -375,6 +421,20 @@ int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,float *ctx,const float
 int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_dev, const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!g_cuda.available){ return 0; }
     return g_cuda.attention_absorb_batch_dev(kv_b_shard, ctx_dev, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
+}
+
+int coli_cuda_tensor_upload_ggml(ColiCudaTensor **tensor,const void *weights,uint32_t dtype,
+        uint64_t weight_bytes,int I,int O,int device){
+    if(!g_cuda.available)return 0;return g_cuda.tensor_upload_ggml(tensor,weights,dtype,weight_bytes,I,O,device);
+}
+int coli_cuda_tensor_view_rows(ColiCudaTensor *base,uint64_t first_row,uint64_t row_count,ColiCudaTensor **view){
+    if(!g_cuda.available)return 0;return g_cuda.tensor_view_rows(base,first_row,row_count,view);
+}
+const void *coli_cuda_tensor_data(const ColiCudaTensor *tensor){
+    if(!g_cuda.available)return NULL;return g_cuda.tensor_data(tensor);
+}
+int coli_cuda_tensor_matmul_host(ColiCudaTensor *tensor,float *y,const float *x,int S){
+    if(!g_cuda.available)return 0;return g_cuda.tensor_matmul_host(tensor,y,x,S);
 }
 
 int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T, float scale){
@@ -410,6 +470,24 @@ int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_add(device, x_dev, t_dev, n);
 }
+int coli_cuda_pipe_axpy(int device,float *y_dev,const float *x_dev,float alpha,size_t n){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_axpy(device,y_dev,x_dev,alpha,n);
+}
+int coli_cuda_pipe_residual(int device,float *y_dev,const float *base_dev,const float *delta_dev,float alpha,size_t n){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_residual(device,y_dev,base_dev,delta_dev,alpha,n);
+}
+int coli_cuda_pipe_zero(int device,float *x_dev,size_t n){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_zero(device,x_dev,n);
+}
+int coli_cuda_pipe_decode_row(ColiCudaTensor *tensor,uint64_t row,float *out_dev,float scale){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_decode_row(tensor,row,out_dev,scale);
+}
+int coli_cuda_pipe_gqa_decode(int device,float *out_dev,const float *q_dev,const float *k_dev,
+        const float *v_dev,float *kc,float *vc,float *scores,int pos,int context_capacity,
+        int H,int HK,int D,float scale){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_gqa_decode(device,out_dev,q_dev,k_dev,v_dev,kc,vc,scores,pos,context_capacity,H,HK,D,scale);
+}
+
 
 void * coli_cuda_pipe_alloc(int device,size_t bytes){
     if(!g_cuda.available){ return NULL; }
@@ -475,6 +553,10 @@ int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows, int 
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_rope_base(device, v_dev, pos_base, rows, stride, offset, R, heads, theta);
 }
+int coli_cuda_pipe_rope_interleaved(int device,float *v_dev,int position,int n_heads,int head_dim,int rope_dims,float theta){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_rope_interleaved(device,v_dev,position,n_heads,head_dim,rope_dims,theta);
+}
+
 
 int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *partial_dev, const int *rows_dev,int nrows,int D){
     if(!g_cuda.available){ return 0; }

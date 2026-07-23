@@ -56,6 +56,9 @@ typedef struct {
     uint64_t data_offset;
     ColiGgufKV *metadata;
     ColiGgufTensorInfo *tensors;
+    void *mapping;
+    void *mapping_handle;
+    uint64_t mapping_size;
     char error[256];
 } ColiGgufFile;
 
@@ -80,6 +83,7 @@ int coli_gguf_kv_read_u32_array(const ColiGgufFile *g, const ColiGgufKV *kv,
                                 uint32_t **out, uint64_t *count_out);
 void coli_gguf_free_string_array(char **items, uint64_t count);
 
+const void *coli_gguf_mapped_at(const ColiGgufFile *g, uint64_t offset, uint64_t bytes);
 int coli_gguf_read_at(const ColiGgufFile *g, uint64_t offset, void *dst, size_t bytes);
 int coli_gguf_read_tensor_bytes(const ColiGgufFile *g,
                                 const ColiGgufTensorInfo *tensor,
