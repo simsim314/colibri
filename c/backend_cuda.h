@@ -197,6 +197,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_router(int device,const float *x_dev,
         const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,
         float topp,int norm_topk,float routed_scale,
         int *idx_host,float *w_host,int *keff_host);
+/* Qwen router selection from logits that are already resident on-device.
+ * Qwen uses global softmax followed by top-k and selected-mass
+ * renormalization; the global denominator cancels, so this kernel selects by
+ * raw logit and normalizes exp(logit) over the selected experts. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_qwen_topk(int device,
+        const float *logits_dev,int E,int Ksel,
+        int *idx_host,float *w_host);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                           int spitch,int width,int height);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,

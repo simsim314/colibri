@@ -23,11 +23,19 @@ int main(void){
     Slot*s=(Slot*)coli_expert_acquire(&st,0,1,1,1,&ops,&ctx,&stats);assert(s==&pin[0]);assert(stats.pin_hits==1);
     s=(Slot*)coli_expert_acquire(&st,0,2,1,1,&ops,&ctx,&stats);assert(s&&s->eid==2&&s->payload==20&&nc==1);
     s=(Slot*)coli_expert_acquire(&st,0,3,1,1,&ops,&ctx,&stats);assert(s&&s->eid==3&&nc==2);
+    /* A backend circuit breaker must preserve hits and demand accounting but
+     * must not evict/load on a miss while admissions are disabled. */
+    int loads_before=ctx.loads,evicts_before=ctx.evicts;
+    s=(Slot*)coli_expert_acquire_controlled(&st,0,3,1,0,1,&ops,&ctx,&stats);
+    assert(s&&s->eid==3&&ctx.loads==loads_before&&ctx.evicts==evicts_before);
+    s=(Slot*)coli_expert_acquire_controlled(&st,0,7,1,0,1,&ops,&ctx,&stats);
+    assert(!s&&ctx.loads==loads_before&&ctx.evicts==evicts_before);
+    assert(heat[7]==1&&usage[7]==1);
     /* Make expert 2 the LRU, then admit 4 and evict exactly one slot. */
     cache[0].used=1;cache[1].used=20;
     s=(Slot*)coli_expert_acquire(&st,0,4,1,1,&ops,&ctx,&stats);assert(s==&cache[0]&&s->eid==4);assert(ctx.evicts==1);
-    assert(heat[1]==1&&heat[2]==1&&heat[3]==1&&heat[4]==1);
-    assert(usage[1]==1&&usage[2]==1&&usage[3]==1&&usage[4]==1);
+    assert(heat[1]==1&&heat[2]==1&&heat[3]==2&&heat[4]==1);
+    assert(usage[1]==1&&usage[2]==1&&usage[3]==2&&usage[4]==1);
     /* The shared PILOT guard protects a warm LRU victim from a cold speculation. */
     cache[0].used=1;cache[1].used=20;heat[4]=20;last[4]=ac;heat[5]=0;last[5]=0;
     ColiExpertAdmission a;assert(!coli_expert_begin_admission(&st,5,1,1,&a));

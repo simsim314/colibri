@@ -1727,6 +1727,56 @@ extern "C" int coli_cuda_pipe_router(int device,const float *x_dev,
     memcpy(keff_host,buf+Ksel*(sizeof(int)+sizeof(float)),sizeof(int));
     return 1;
 }
+
+/* Qwen3-Next top-k from already-computed router logits. Selection is kept
+ * single-threaded to match the CPU reference's stable lower-index tie break.
+ * Non-finite logits are treated as unavailable; if every logit is non-finite
+ * the deterministic fallback is experts [0..K-1] with uniform weights. */
+__global__ static void pipe_qwen_topk_select(const float *logits,int E,int Ksel,char *out){
+    if(threadIdx.x||blockIdx.x) return;
+    int *idx=(int*)out;
+    float *w=(float*)(out+(size_t)Ksel*sizeof(int));
+    int valid=0;
+    for(int kk=0;kk<Ksel;kk++){
+        int best=-1; float bv=-3.402823466e+38F;
+        for(int e=0;e<E;e++){
+            int used=0; for(int j=0;j<kk;j++) if(idx[j]==e){used=1;break;}
+            float v=logits[e];
+            if(!used&&isfinite(v)&&(best<0||v>bv||(v==bv&&e<best))){best=e;bv=v;}
+        }
+        if(best<0) break;
+        idx[kk]=best; w[kk]=bv; valid++;
+    }
+    if(valid<Ksel){
+        for(int kk=0;kk<Ksel;kk++){idx[kk]=kk%E;w[kk]=1.f/(float)Ksel;}
+        return;
+    }
+    float maxv=w[0]; for(int kk=1;kk<Ksel;kk++) if(w[kk]>maxv) maxv=w[kk];
+    float sum=0.f;
+    for(int kk=0;kk<Ksel;kk++){w[kk]=expf(w[kk]-maxv);sum+=w[kk];}
+    if(!(sum>0.f)||!isfinite(sum)){
+        float u=1.f/(float)Ksel; for(int kk=0;kk<Ksel;kk++) w[kk]=u;
+    } else {
+        float inv=1.f/sum; for(int kk=0;kk<Ksel;kk++) w[kk]*=inv;
+    }
+}
+
+extern "C" int coli_cuda_pipe_qwen_topk(int device,const float *logits_dev,
+        int E,int Ksel,int *idx_host,float *w_host){
+    DeviceContext *ctx=find_ctx(device);
+    if(!logits_dev||!idx_host||!w_host||E<1||E>4096||Ksel<1||Ksel>64||Ksel>E||
+       !select_ctx(ctx)) return 0;
+    size_t pack=(size_t)Ksel*(sizeof(int)+sizeof(float));
+    char *out=(char*)coli_cuda_pipe_scratch(device,26,pack);
+    if(!out) return 0;
+    pipe_qwen_topk_select<<<1,1>>>(logits_dev,E,Ksel,out);
+    if(!cuda_ok(cudaGetLastError(),"Qwen router top-k launch")) return 0;
+    char buf[64*(sizeof(int)+sizeof(float))];
+    if(!cuda_ok(cudaMemcpy(buf,out,pack,cudaMemcpyDeviceToHost),"Qwen router top-k readback")) return 0;
+    memcpy(idx_host,buf,(size_t)Ksel*sizeof(int));
+    memcpy(w_host,buf+(size_t)Ksel*sizeof(int),(size_t)Ksel*sizeof(float));
+    return 1;
+}
 /* ---- resident expert-group accumulation (#431 PR-C0) ----------------------
  * Decode-time (S=1) expert groups without the host round-trip: the input row
  * is P2P'd from the layer's home device, the group runs through the grouped-W4

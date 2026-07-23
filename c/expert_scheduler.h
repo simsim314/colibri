@@ -90,6 +90,18 @@ void *coli_expert_acquire(ColiExpertLayerStore *store, int layer, int eid,
                           const ColiExpertStorageOps *ops, void *ctx,
                           ColiExpertSchedulerStats *stats);
 
+/* Same policy as coli_expert_acquire(), but callers may disable new
+ * admissions while preserving demand accounting and resident hits. This is
+ * used by memory-constrained backends after the first device-residency
+ * failure: already-resident experts remain usable, misses fall back to a
+ * different execution tier, and the scheduler does not evict a good slot for
+ * an upload that is known to fail. */
+void *coli_expert_acquire_controlled(ColiExpertLayerStore *store, int layer,
+                                     int eid, int demand, int allow_admission,
+                                     int evict_guard,
+                                     const ColiExpertStorageOps *ops, void *ctx,
+                                     ColiExpertSchedulerStats *stats);
+
 /* Promote a fully loaded temporary slot into the existing LRU cache by swapping
  * complete slot payloads. This preserves the legacy asynchronous load pipeline. */
 void *coli_expert_promote_loaded(ColiExpertLayerStore *store, void *loaded_slot,

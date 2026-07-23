@@ -130,10 +130,10 @@ void coli_expert_finish_admission(ColiExpertLayerStore *s,
     coli_expert_slot_touch(a->slot, &s->layout, s->clock);
 }
 
-void *coli_expert_acquire(ColiExpertLayerStore *s, int layer, int eid,
-                          int demand, int guard,
-                          const ColiExpertStorageOps *ops, void *ctx,
-                          ColiExpertSchedulerStats *stats) {
+void *coli_expert_acquire_controlled(ColiExpertLayerStore *s, int layer, int eid,
+                                     int demand, int allow_admission, int guard,
+                                     const ColiExpertStorageOps *ops, void *ctx,
+                                     ColiExpertSchedulerStats *stats) {
     if (!s || !ops || !ops->load) return NULL;
     if (demand) coli_expert_record_demand(s, eid);
     ColiExpertLookup h = coli_expert_lookup(s, eid, 0);
@@ -145,6 +145,7 @@ void *coli_expert_acquire(ColiExpertLayerStore *s, int layer, int eid,
         return h.slot;
     }
     if (demand && stats) stats->misses++;
+    if (!allow_admission) return NULL;
     ColiExpertAdmission a;
     if (!coli_expert_begin_admission(s, eid, !demand, guard, &a)) {
         if (!demand && stats) stats->speculative_drops++;
@@ -162,6 +163,14 @@ void *coli_expert_acquire(ColiExpertLayerStore *s, int layer, int eid,
     if (!ok) { if (!demand && stats) stats->speculative_drops++; return NULL; }
     if (stats) { stats->admissions++; if (!demand) stats->speculative_loads++; }
     return a.slot;
+}
+
+void *coli_expert_acquire(ColiExpertLayerStore *s, int layer, int eid,
+                          int demand, int guard,
+                          const ColiExpertStorageOps *ops, void *ctx,
+                          ColiExpertSchedulerStats *stats) {
+    return coli_expert_acquire_controlled(s, layer, eid, demand, 1, guard,
+                                          ops, ctx, stats);
 }
 
 void *coli_expert_promote_loaded(ColiExpertLayerStore *s, void *loaded, int *evicted_eid) {

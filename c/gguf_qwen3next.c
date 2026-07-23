@@ -95,11 +95,25 @@ typedef struct {
     ColiExpertSchedulerStats scheduler_stats;
     int scheduler_evict_guard;
     int repin_interval, tokens_since_repin;
-    int pilot, pilot_real, pilot_k;
+    int pilot, pilot_real, pilot_real_downgraded, pilot_k;
     int couple, couple_k, couple_d;
     ColiExpertCoupling coupling;
     char usage_path[2048];
     int64_t usage_history;
+
+    /* Qwen's top-10 routing commonly runs with only one replaceable slot per
+     * layer on 6 GB cards. After the first CUDA residency failure, keep using
+     * existing pin/LRU hits but stop destructive miss admissions and execute
+     * misses directly from the mmap-backed tensors on CPU. */
+    int cuda_expert_admission_disabled;
+    int cuda_expert_compute_disabled;
+    int cuda_expert_failure_reported;
+    uint64_t cuda_expert_residency_failures;
+    uint64_t cuda_expert_compute_failures;
+    uint64_t cuda_expert_cpu_fallbacks;
+    int cuda_router_gpu_enabled;
+    uint64_t cuda_router_gpu_calls;
+    uint64_t cuda_router_cpu_fallbacks;
 
     int verbose;
     ColiExec exec;
@@ -624,6 +638,10 @@ static int qwen_storage_load(void *ctx, int layer, int eid, void *slot, int dema
     coli_tensor_prefetch_host(s->down);
 #ifdef COLI_CUDA
     if (m->exec.kind == COLI_BACKEND_CUDA) {
+        if (m->cuda_expert_admission_disabled) {
+            s->eid = -1; s->gate = s->up = s->down = NULL;
+            return 0;
+        }
         if (!coli_tensor_reside(&m->exec, s->gate) ||
             !coli_tensor_reside(&m->exec, s->up) ||
             !coli_tensor_reside(&m->exec, s->down)) {
@@ -631,6 +649,13 @@ static int qwen_storage_load(void *ctx, int layer, int eid, void *slot, int dema
             coli_tensor_release_backend(&m->exec, s->up);
             coli_tensor_release_backend(&m->exec, s->down);
             s->eid = -1; s->gate = s->up = s->down = NULL;
+            m->cuda_expert_admission_disabled = 1;
+            ++m->cuda_expert_residency_failures;
+            if (!m->cuda_expert_failure_reported) {
+                m->cuda_expert_failure_reported = 1;
+                fprintf(stderr,
+                    "[QWEN] CUDA expert residency failed; disabling new GPU admissions and using mmap CPU fallback for misses\n");
+            }
             return 0;
         }
         m->cuda_expert_bytes += m->expert_bytes;
@@ -667,8 +692,12 @@ static const ColiExpertStorageOps g_qwen_storage = {
 
 static QwenExpertSlot *qwen_expert_acquire(QwenModel *m, int layer, int eid, int demand) {
     ColiExpertLayerStore st = qwen_store(m, layer);
-    return (QwenExpertSlot *)coli_expert_acquire(&st, layer, eid, demand,
-            m->scheduler_evict_guard, &g_qwen_storage, m, &m->scheduler_stats);
+    int allow = 1;
+#ifdef COLI_CUDA
+    if (m->exec.kind == COLI_BACKEND_CUDA && m->cuda_expert_admission_disabled) allow = 0;
+#endif
+    return (QwenExpertSlot *)coli_expert_acquire_controlled(&st, layer, eid, demand,
+            allow, m->scheduler_evict_guard, &g_qwen_storage, m, &m->scheduler_stats);
 }
 
 static void qwen_usage_path(QwenModel *m, const char *model_path) {
@@ -727,6 +756,10 @@ static int qwen_stats_fallback(QwenModel *m, char *path, size_t cap) {
 
 static int qwen_scheduler_init(QwenModel *m, char *err, size_t cap) {
     m->scheduler_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
+    {
+        const char *v = getenv("QWEN_ROUTER_GPU");
+        m->cuda_router_gpu_enabled = !v || atoi(v) != 0;
+    }
     m->repin_interval = getenv("REPIN") ? atoi(getenv("REPIN")) : 0;
     m->pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     m->pilot_real = getenv("PILOT_REAL") ? atoi(getenv("PILOT_REAL")) : 0;
@@ -838,6 +871,24 @@ static int qwen_scheduler_init(QwenModel *m, char *err, size_t cap) {
         }
         for (int z = 0; z < x->npin; ++z) x->pin[z].eid = -1;
         for (int z = 0; z < x->cache_cap; ++z) x->cache[z].eid = -1;
+    }
+
+    /* A real speculative upload is counterproductive when the replaceable
+     * tier cannot hold one complete routed set. It steals the layer's only
+     * LRU slot before the real top-10 demand arrives. Preserve PILOT as a
+     * page-cache hint unless the user explicitly forces the old behavior. */
+    if (m->pilot_real && !(getenv("PILOT_REAL_FORCE") && atoi(getenv("PILOT_REAL_FORCE")))) {
+        int min_cache = INT_MAX;
+        for (int l = 0; l < m->n_layers; ++l)
+            if (m->layers[l].cache_cap < min_cache) min_cache = m->layers[l].cache_cap;
+        if (min_cache < m->n_expert_used) {
+            m->pilot_real = 0;
+            m->pilot_real_downgraded = 1;
+            if (m->verbose)
+                fprintf(stderr,
+                    "[PILOT] Qwen real prefetch downgraded to mmap hint: min LRU/layer=%d < routed top-%d (set PILOT_REAL_FORCE=1 to override)\n",
+                    min_cache, m->n_expert_used);
+        }
     }
 
     if (pin_total == total) {
@@ -1208,6 +1259,68 @@ static int qwen_mm_device(QwenModel *m, float *y, const float *x, ColiTensor *w,
     return 1;
 }
 
+/* Routed-expert CUDA execution is intentionally kept one expert at a time.
+ * On small cards this lets a single LRU slot be reused immediately instead of
+ * bulk-admitting ten experts that cannot coexist. Do not write an error here:
+ * the caller can fall back to the mmap-backed CPU tensor path. */
+static int qwen_expert_device(QwenModel *m, QwenScratch *s,
+                              const QwenExpertSlot *slot, float weight) {
+    if (!slot || !slot->gate || !slot->up || !slot->down ||
+        m->cuda_expert_compute_disabled) return 0;
+    const int dev = m->exec.device;
+    return coli_tensor_matmul_device(&m->exec, s->dgate, s->dpost, slot->gate, 1) &&
+           coli_tensor_matmul_device(&m->exec, s->dup, s->dpost, slot->up, 1) &&
+           coli_cuda_pipe_silu_mul(dev, s->dgate, s->dup, (size_t)m->expert_ff) &&
+           coli_tensor_matmul_device(&m->exec, s->dexpert_out, s->dgate, slot->down, 1) &&
+           coli_cuda_pipe_axpy(dev, s->dmoe, s->dexpert_out, weight, (size_t)m->hidden);
+}
+
+static int qwen_expert_cpu_accumulate(QwenModel *m, QwenScratch *s,
+                                      QwenLayer *L, int eid, float weight,
+                                      int *post_ready, int *moe_ready,
+                                      char *err, size_t cap) {
+    if (eid < 0 || eid >= m->n_experts) return qwen_errf(err, cap, "invalid Qwen expert id");
+    if (!*post_ready) {
+        if (!coli_cuda_pipe_download(m->exec.device, s->dpost, s->post,
+                                     (size_t)m->hidden * sizeof(float)))
+            return qwen_errf(err, cap, "cannot download Qwen expert input for CPU fallback");
+        *post_ready = 1;
+    }
+    if (!*moe_ready) {
+        memset(s->moe, 0, (size_t)m->hidden * sizeof(float));
+        *moe_ready = 1;
+    }
+    ColiTensor *gate = &L->gate_expert[eid];
+    ColiTensor *up = &L->up_expert[eid];
+    ColiTensor *down = &L->down_expert[eid];
+    coli_tensor_prefetch_host(gate);
+    coli_tensor_prefetch_host(up);
+    coli_tensor_prefetch_host(down);
+    if (!qwen_mm_cpu(s->gate, s->post, gate, m->hidden, m->expert_ff, err, cap) ||
+        !qwen_mm_cpu(s->up, s->post, up, m->hidden, m->expert_ff, err, cap)) return 0;
+    for (int i = 0; i < m->expert_ff; ++i)
+        s->gate[i] = coli_f32_silu(s->gate[i]) * s->up[i];
+    if (!qwen_mm_cpu(s->expert_out, s->gate, down,
+                     m->expert_ff, m->hidden, err, cap)) return 0;
+    for (int i = 0; i < m->hidden; ++i) s->moe[i] += weight * s->expert_out[i];
+    ++m->cuda_expert_cpu_fallbacks;
+    return 1;
+}
+
+static int qwen_router_topk_cuda(QwenModel *m, QwenScratch *s, int k,
+                                 int *idx, float *weights) {
+    if (m->cuda_router_gpu_enabled &&
+        coli_cuda_pipe_qwen_topk(m->exec.device, s->drouter,
+                                 m->n_experts, k, idx, weights)) {
+        ++m->cuda_router_gpu_calls;
+        return k;
+    }
+    ++m->cuda_router_cpu_fallbacks;
+    if (!coli_cuda_pipe_download(m->exec.device, s->drouter, s->router,
+                                 (size_t)m->n_experts * sizeof(float))) return 0;
+    return coli_f32_router_topk(s->router, m->n_experts, k, idx, weights);
+}
+
 static int qwen_forward_cuda(QwenModel *m, QwenScratch *s, int token, int pos,
                              char *err, size_t cap) {
     const int dev = m->exec.device;
@@ -1269,19 +1382,18 @@ static int qwen_forward_cuda(QwenModel *m, QwenScratch *s, int token, int pos,
         w = qwen_f32_device(m, &L->post_norm, m->hidden, err, cap);
         if (!w || !coli_cuda_pipe_rmsnorm(dev, s->dpost, s->dx, w, 1, m->hidden, m->eps)) return 0;
 
-        if (!qwen_mm_device(m, s->drouter, s->dpost, &L->router, err, cap) ||
-            !coli_cuda_pipe_download(dev, s->drouter, s->router,
-                                     (size_t)m->n_experts * sizeof(float))) return 0;
-        const int nk = coli_f32_router_topk(s->router, m->n_experts, m->n_expert_used,
-                                            s->top_idx, s->top_w);
+        if (!qwen_mm_device(m, s->drouter, s->dpost, &L->router, err, cap)) return 0;
+        const int nk = qwen_router_topk_cuda(m, s, m->n_expert_used,
+                                             s->top_idx, s->top_w);
+        if (nk != m->n_expert_used)
+            return qwen_errf(err, cap, "Qwen CUDA router top-k failed at layer %d", l);
         qwen_couple_prefetch(m, l, s->top_idx, nk);
         if (m->pilot && l + 1 < m->n_layers) {
             int pidx[64]; float pw[64];
             const int keep = m->pilot_k < 64 ? m->pilot_k : 64;
-            if (!qwen_mm_device(m, s->drouter, s->dpost, &m->layers[l + 1].router, err, cap) ||
-                !coli_cuda_pipe_download(dev, s->drouter, s->router,
-                                         (size_t)m->n_experts * sizeof(float))) return 0;
-            const int pn = coli_f32_router_topk(s->router, m->n_experts, keep, pidx, pw);
+            if (!qwen_mm_device(m, s->drouter, s->dpost, &m->layers[l + 1].router, err, cap)) return 0;
+            const int pn = qwen_router_topk_cuda(m, s, keep, pidx, pw);
+            if (pn != keep) return qwen_errf(err, cap, "Qwen pilot router top-k failed at layer %d", l + 1);
             qwen_prefetch_ids(m, l + 1, pidx, pn);
         }
 
@@ -1294,15 +1406,31 @@ static int qwen_forward_cuda(QwenModel *m, QwenScratch *s, int token, int pos,
             !coli_cuda_pipe_sigmoid_scale(dev, s->dshared_out, s->dshared_gate, (size_t)m->hidden) ||
             !coli_cuda_pipe_add(dev, s->dmoe, s->dshared_out, (size_t)m->hidden)) return 0;
 
+        int post_host_ready = 0;
+        int host_moe_ready = 0;
         for (int j = 0; j < nk; ++j) {
             const int e = s->top_idx[j];
             QwenExpertSlot *slot = qwen_expert_acquire(m, l, e, 1);
-            if (!slot) return qwen_errf(err, cap, "Qwen expert admission failed at layer %d expert %d", l, e);
-            if (!qwen_mm_device(m, s->dgate, s->dpost, slot->gate, err, cap) ||
-                !qwen_mm_device(m, s->dup, s->dpost, slot->up, err, cap) ||
-                !coli_cuda_pipe_silu_mul(dev, s->dgate, s->dup, (size_t)m->expert_ff) ||
-                !qwen_mm_device(m, s->dexpert_out, s->dgate, slot->down, err, cap) ||
-                !coli_cuda_pipe_axpy(dev, s->dmoe, s->dexpert_out, s->top_w[j], (size_t)m->hidden)) return 0;
+            if (slot && qwen_expert_device(m, s, slot, s->top_w[j])) continue;
+            if (slot && !m->cuda_expert_compute_disabled) {
+                m->cuda_expert_compute_disabled = 1;
+                m->cuda_expert_admission_disabled = 1;
+                ++m->cuda_expert_compute_failures;
+                if (!m->cuda_expert_failure_reported) {
+                    m->cuda_expert_failure_reported = 1;
+                    fprintf(stderr,
+                        "[QWEN] CUDA expert execution failed; using mmap CPU fallback for remaining routed experts\n");
+                }
+            }
+            if (!qwen_expert_cpu_accumulate(m, s, L, e, s->top_w[j],
+                                             &post_host_ready, &host_moe_ready,
+                                             err, cap)) return 0;
+        }
+        if (host_moe_ready) {
+            if (!coli_cuda_pipe_upload(dev, s->dexpert_out, s->moe,
+                                       (size_t)m->hidden * sizeof(float)) ||
+                !coli_cuda_pipe_add(dev, s->dmoe, s->dexpert_out, (size_t)m->hidden))
+                return qwen_errf(err, cap, "cannot merge Qwen CPU expert fallback at layer %d", l);
         }
         if (!coli_cuda_pipe_add(dev, s->dx, s->dmoe, (size_t)m->hidden)) return 0;
     }
@@ -1488,6 +1616,20 @@ int coli_qwen3next_run_cli(int argc, char **argv) {
             (unsigned long long)m.scheduler_stats.evictions,
             (unsigned long long)m.scheduler_stats.speculative_loads,
             (unsigned long long)m.scheduler_stats.speculative_drops);
+#ifdef COLI_CUDA
+        if (m.exec.kind == COLI_BACKEND_CUDA)
+            fprintf(stderr,
+                "[QWEN] router=%s router_gpu=%llu router_cpu_fallback=%llu expert_cpu_fallback=%llu residency_fail=%llu compute_fail=%llu admissions=%s pilot=%s%s\n",
+                m.cuda_router_gpu_enabled ? "gpu" : "cpu",
+                (unsigned long long)m.cuda_router_gpu_calls,
+                (unsigned long long)m.cuda_router_cpu_fallbacks,
+                (unsigned long long)m.cuda_expert_cpu_fallbacks,
+                (unsigned long long)m.cuda_expert_residency_failures,
+                (unsigned long long)m.cuda_expert_compute_failures,
+                m.cuda_expert_admission_disabled ? "disabled" : "enabled",
+                m.pilot ? (m.pilot_real ? "real" : "hint") : "off",
+                m.pilot_real_downgraded ? " (auto-downgraded)" : "");
+#endif
     }
     qwen_usage_save(&m); qwen_scratch_free(&s); qwen_model_free(&m); free(ids);
 #ifdef COLI_CUDA
