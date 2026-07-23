@@ -358,6 +358,58 @@ int coli_gguf_kv_read_string(const ColiGgufFile *g, const ColiGgufKV *kv, char *
     return 1;
 }
 
+
+void coli_gguf_free_string_array(char **items, uint64_t count) {
+    if (!items) return;
+    for (uint64_t i = 0; i < count; ++i) free(items[i]);
+    free(items);
+}
+
+int coli_gguf_kv_read_string_array(const ColiGgufFile *g, const ColiGgufKV *kv,
+                                   char ***out, uint64_t *count_out) {
+    if (!g || !kv || !out || !count_out || kv->type != COLI_GGUF_TYPE_ARRAY ||
+        kv->array_type != COLI_GGUF_TYPE_STRING || kv->array_count > SIZE_MAX / sizeof(char *)) return 0;
+    char **items = kv->array_count ? (char **)calloc((size_t)kv->array_count, sizeof(char *)) : NULL;
+    if (kv->array_count && !items) return 0;
+    uint64_t off = kv->value_offset;
+    for (uint64_t i = 0; i < kv->array_count; ++i) {
+        uint64_t n, start, next;
+        if (!read_u64_at(g, off, &n) || n > SIZE_MAX - 1 ||
+            add_overflow_u64(off, 8, &start) || add_overflow_u64(start, n, &next) ||
+            next > g->file_size) {
+            coli_gguf_free_string_array(items, i);
+            return 0;
+        }
+        items[i] = (char *)malloc((size_t)n + 1);
+        if (!items[i] || !read_raw(g, start, items[i], (size_t)n)) {
+            free(items[i]);
+            coli_gguf_free_string_array(items, i);
+            return 0;
+        }
+        items[i][n] = '\0';
+        off = next;
+    }
+    *out = items;
+    *count_out = kv->array_count;
+    return 1;
+}
+
+int coli_gguf_kv_read_u32_array(const ColiGgufFile *g, const ColiGgufKV *kv,
+                                uint32_t **out, uint64_t *count_out) {
+    if (!g || !kv || !out || !count_out || kv->type != COLI_GGUF_TYPE_ARRAY ||
+        (kv->array_type != COLI_GGUF_TYPE_UINT32 && kv->array_type != COLI_GGUF_TYPE_INT32) ||
+        kv->array_count > SIZE_MAX / sizeof(uint32_t)) return 0;
+    uint32_t *items = kv->array_count ? (uint32_t *)malloc((size_t)kv->array_count * sizeof(uint32_t)) : NULL;
+    if (kv->array_count && !items) return 0;
+    uint64_t off = kv->value_offset;
+    for (uint64_t i = 0; i < kv->array_count; ++i, off += 4) {
+        if (!read_u32_at(g, off, &items[i])) { free(items); return 0; }
+    }
+    *out = items;
+    *count_out = kv->array_count;
+    return 1;
+}
+
 int coli_gguf_read_tensor_bytes(const ColiGgufFile *g,
                                 const ColiGgufTensorInfo *tensor,
                                 uint64_t relative_offset,

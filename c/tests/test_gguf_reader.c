@@ -48,7 +48,7 @@ static int write_fixture(const char *path) {
     if (!f) return 0;
 
     int ok = fwrite("GGUF", 1, 4, f) == 4 &&
-             put_u32(f, 3) && put_u64(f, 2) && put_u64(f, 5);
+             put_u32(f, 3) && put_u64(f, 2) && put_u64(f, 6);
 
     ok = ok && put_string(f, "general.architecture") && put_u32(f, COLI_GGUF_TYPE_STRING) &&
          put_string(f, "qwen3next");
@@ -59,6 +59,8 @@ static int write_fixture(const char *path) {
     ok = ok && put_string(f, "tokenizer.ggml.tokens") && put_u32(f, COLI_GGUF_TYPE_ARRAY) &&
          put_u32(f, COLI_GGUF_TYPE_STRING) && put_u64(f, 2) &&
          put_string(f, "hello") && put_string(f, "world");
+    ok = ok && put_string(f, "tokenizer.ggml.token_type") && put_u32(f, COLI_GGUF_TYPE_ARRAY) &&
+         put_u32(f, COLI_GGUF_TYPE_UINT32) && put_u64(f, 2) && put_u32(f, 1) && put_u32(f, 3);
     ok = ok && put_string(f, "test.flag") && put_u32(f, COLI_GGUF_TYPE_BOOL) && put_u8(f, 1);
 
     ok = ok && put_string(f, "token_embd.weight") && put_u32(f, 2) &&
@@ -89,7 +91,7 @@ int main(void) {
     CHECK(coli_gguf_open(&g, path));
     CHECK(g.version == 3);
     CHECK(g.tensor_count == 2);
-    CHECK(g.metadata_count == 5);
+    CHECK(g.metadata_count == 6);
     CHECK(g.alignment == 64);
     CHECK(g.data_offset % 64 == 0);
 
@@ -110,6 +112,16 @@ int main(void) {
     CHECK(tokens->type == COLI_GGUF_TYPE_ARRAY);
     CHECK(tokens->array_type == COLI_GGUF_TYPE_STRING);
     CHECK(tokens->array_count == 2);
+    char **token_strings = NULL; uint64_t token_count = 0;
+    CHECK(coli_gguf_kv_read_string_array(&g, tokens, &token_strings, &token_count));
+    CHECK(token_count == 2 && strcmp(token_strings[0], "hello") == 0 && strcmp(token_strings[1], "world") == 0);
+    coli_gguf_free_string_array(token_strings, token_count);
+
+    const ColiGgufKV *types = coli_gguf_find_kv(&g, "tokenizer.ggml.token_type");
+    uint32_t *token_types = NULL; uint64_t type_count = 0;
+    CHECK(types && coli_gguf_kv_read_u32_array(&g, types, &token_types, &type_count));
+    CHECK(type_count == 2 && token_types[0] == 1 && token_types[1] == 3);
+    free(token_types);
 
     const ColiGgufKV *flag = coli_gguf_find_kv(&g, "test.flag");
     int b = 0;

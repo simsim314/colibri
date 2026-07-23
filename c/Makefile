@@ -200,6 +200,7 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_gguf_reader$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
+TEST_BINS += tests/test_ggml_types$(EXE) tests/test_ggml_quants$(EXE) tests/test_gguf_f32_loader$(EXE) tests/test_f32_kernels$(EXE) tests/test_gguf_tokenizer$(EXE) tests/test_gguf_granite$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -255,6 +256,9 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
+GGUF_RUNTIME_SRC = gguf_granite.c gguf_tokenizer.c gguf_f32_loader.c ggml_quants.c ggml_types.c gguf_reader.c
+GGUF_RUNTIME_HDR = gguf_granite.h gguf_tokenizer.h gguf_f32_loader.h ggml_quants.h ggml_types.h gguf_reader.h f32_kernels.h
+
 all: colibri$(EXE)
 
 # phony targets — 'glm' kept for backward compatibility
@@ -281,8 +285,15 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR) $(CUDA_OBJ) $(METAL_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(GGUF_RUNTIME_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+run-f32-gguf$(EXE): run_f32_gguf.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR) .build-config
+	$(CC) $(CFLAGS) run_f32_gguf.c $(GGUF_RUNTIME_SRC) -o $@ $(LDFLAGS)
+
+ifneq ($(EXE),)
+run-f32-gguf: run-f32-gguf$(EXE)
+endif
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -360,6 +371,24 @@ gguf-inspect$(EXE): gguf_inspect.c gguf_reader.c gguf_reader.h compat.h
 
 tests/test_gguf_reader$(EXE): tests/test_gguf_reader.c gguf_reader.c gguf_reader.h compat.h
 	$(CC) $(CFLAGS) tests/test_gguf_reader.c gguf_reader.c -o $@ $(LDFLAGS)
+
+tests/test_ggml_types$(EXE): tests/test_ggml_types.c ggml_types.c ggml_types.h
+	$(CC) $(CFLAGS) tests/test_ggml_types.c ggml_types.c -o $@ $(LDFLAGS)
+
+tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
+	$(CC) $(CFLAGS) tests/test_ggml_quants.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
+
+tests/test_gguf_f32_loader$(EXE): tests/test_gguf_f32_loader.c gguf_f32_loader.c gguf_f32_loader.h gguf_reader.c gguf_reader.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
+	$(CC) $(CFLAGS) tests/test_gguf_f32_loader.c gguf_f32_loader.c gguf_reader.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
+
+tests/test_f32_kernels$(EXE): tests/test_f32_kernels.c f32_kernels.h
+	$(CC) $(CFLAGS) tests/test_f32_kernels.c -o $@ $(LDFLAGS)
+
+tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_tokenizer.h gguf_reader.c gguf_reader.h tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c -o $@ $(LDFLAGS)
+
+tests/test_gguf_granite$(EXE): tests/test_gguf_granite.c gguf_granite.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
+	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_tokenizer.c gguf_f32_loader.c ggml_quants.c ggml_types.c gguf_reader.c -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -513,4 +542,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm gguf-inspect cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm gguf-inspect run-f32-gguf cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

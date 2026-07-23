@@ -3,6 +3,7 @@
  * NEON-i8mm / POWER VSX.  Pure compute — no Model or QT dependency. */
 #ifndef COLI_QUANT_H
 #define COLI_QUANT_H
+#include "f32_kernels.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,9 +97,7 @@ static int i4_acc512_selftest(void){
 
 /* ---- y[S,O] = x[S,I] @ W^T, W[O,I] f32 ---------------------------------- */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
-    #pragma omp parallel for schedule(static)
-    for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
-        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
+    coli_f32_matmul(y, x, W, S, I, O);
 }
 
 /* ---- y[S,O] = x[S,I] @ W^T, W int8 per-row + scale[O] ------------------- */

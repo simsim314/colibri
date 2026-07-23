@@ -74,6 +74,11 @@ int coli_gguf_kv_read_i64(const ColiGgufFile *g, const ColiGgufKV *kv, int64_t *
 int coli_gguf_kv_read_f64(const ColiGgufFile *g, const ColiGgufKV *kv, double *out);
 int coli_gguf_kv_read_bool(const ColiGgufFile *g, const ColiGgufKV *kv, int *out);
 int coli_gguf_kv_read_string(const ColiGgufFile *g, const ColiGgufKV *kv, char **out);
+int coli_gguf_kv_read_string_array(const ColiGgufFile *g, const ColiGgufKV *kv,
+                                   char ***out, uint64_t *count_out);
+int coli_gguf_kv_read_u32_array(const ColiGgufFile *g, const ColiGgufKV *kv,
+                                uint32_t **out, uint64_t *count_out);
+void coli_gguf_free_string_array(char **items, uint64_t count);
 
 int coli_gguf_read_at(const ColiGgufFile *g, uint64_t offset, void *dst, size_t bytes);
 int coli_gguf_read_tensor_bytes(const ColiGgufFile *g,

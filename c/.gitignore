@@ -5,3 +5,13 @@ olmoe_i4/
 .build-config
 tests/test_st_mirror
 tests/test_st_pread
+
+# generated GGUF/F32 runner artifacts
+colibri
+run-f32-gguf
+tests/test_ggml_types
+tests/test_ggml_quants
+tests/test_gguf_f32_loader
+tests/test_f32_kernels
+tests/test_gguf_tokenizer
+tests/test_gguf_granite

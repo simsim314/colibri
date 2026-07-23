@@ -51,7 +51,9 @@ typedef struct {
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
-    int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
+    int o200k;           /* pre_tokenizer regex family: 0 = cl100k, 1 = o200k */
+    int refact;          /* StarCoder/Refact regex: digits are split individually */
+    int ignore_merges;   /* emit a whole pre-tokenized piece directly when present */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -109,6 +111,8 @@ static void tok_load(Tok *T, const char *path){
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
+    jval *ignore_merges=json_get(model,"ignore_merges");
+    T->ignore_merges = ignore_merges && ignore_merges->t==J_BOOL && ignore_merges->boolean;
     jval *added=json_get(root,"added_tokens");
     if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
@@ -195,7 +199,7 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
     for(int i=a;i<b;i++){ int bb=p[i]; memcpy(s+sl,T->byte2str[bb],T->byte2cp_len[bb]); sl+=T->byte2cp_len[bb]; }
     s[sl]=0;
     /* ignore_merges: se l'intero pezzo e' un token, emettilo diretto */
-    int whole=hm_get(&T->vocab,s,sl);
+    int whole=T->ignore_merges ? hm_get(&T->vocab,s,sl) : -1;
     if(whole>=0){ if(*no<max) out[(*no)++]=whole; free(s); return; }
     /* simboli iniziali = codepoint della stringa byte-level */
     int *soff=malloc((sl+1)*sizeof(int)), *slen=malloc((sl+1)*sizeof(int)); int ns=0;
@@ -378,6 +382,65 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
     free(cp); free(off);
 }
 
+
+/* Refact/StarCoder pre-tokenizer:
+ *   \p{N}
+ *   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)
+ * The first expression wins, so numeric runs are emitted one digit at a time. */
+static void pretok_chunk_refact(Tok *T, const unsigned char *p, int a, int b,
+                                int *out, int *no, int max) {
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
+    for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
+    off[n]=b;
+    #define RFLOW(c) (((c)>='A'&&(c)<='Z')?((c)+32):(c))
+    int i=0;
+    while(i<n){
+        int start=i; uint32_t c=cp[i];
+        if(is_N(c)){ i++; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        if(c=='\'' && i+1<n){
+            uint32_t d=RFLOW(cp[i+1]);
+            if(i+2<n){ uint32_t e=RFLOW(cp[i+2]);
+                if((d=='r'&&e=='e')||(d=='v'&&e=='e')||(d=='l'&&e=='l')){
+                    i+=3; bpe_piece(T,p,off[start],off[i],out,no,max); continue; } }
+            if(d=='s'||d=='t'||d=='m'||d=='d'){
+                i+=2; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        }
+        {
+            int j=i;
+            if(c==' ' && j+1<n && is_L(cp[j+1])) j++;
+            if(j<n && is_L(cp[j])){
+                while(j<n && is_L(cp[j])) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        {
+            int j=i;
+            if(c==' ' && j+1<n && is_N(cp[j+1])) j++;
+            if(j<n && is_N(cp[j])){
+                while(j<n && is_N(cp[j])) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        {
+            int j=i;
+            if(c==' ' && j+1<n && !is_S(cp[j+1]) && !is_L(cp[j+1]) && !is_N(cp[j+1])) j++;
+            if(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])){
+                while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++;
+                i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+            }
+        }
+        if(is_S(c)){
+            int j=i; while(j<n && is_S(cp[j])) j++;
+            int end=(j<n)?j-1:j; if(end<=i) end=i+1;
+            i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+        }
+        i++; bpe_piece(T,p,off[start],off[i],out,no,max);
+    }
+    #undef RFLOW
+    free(cp); free(off);
+}
+
 /* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
@@ -392,8 +455,9 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
-            else         pretok_chunk(T,p,i,chunk_end,out,&no,max);
+            if(T->o200k)      pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
+            else if(T->refact) pretok_chunk_refact(T,p,i,chunk_end,out,&no,max);
+            else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;

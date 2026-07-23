@@ -55,6 +55,12 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+/* Normal builds expose native GGUF inference. Unit tests rename `main` before
+ * including this file, so they deliberately omit the CLI/runtime dependency. */
+#ifndef main
+#include "gguf_granite.h"
+#define COLI_GGUF_RUNTIME_ENABLED 1
+#endif
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -798,8 +804,7 @@ static void qt_fill(QT *t, const float *w, int bits){
 }
 
 static void rmsnorm(float *out, const float *x, const float *w, int D, float eps){
-    double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
-    float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
+    coli_f32_rmsnorm(out, x, w, D, eps);
 }
 /* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
 static void layernorm(float *v, const float *w, const float *b, int n, float eps){
@@ -808,8 +813,7 @@ static void layernorm(float *v, const float *w, const float *b, int n, float eps
     float r=1.f/sqrtf((float)var+eps);
     for(int i=0;i<n;i++) v[i]=((float)(v[i]-mu))*r*w[i]+b[i];
 }
-static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i]>m)m=x[i];
-    float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++) x[i]/=s; }
+static void softmax(float *x,int n){ coli_f32_softmax(x,n); }
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
@@ -6333,6 +6337,9 @@ int main(int argc, char **argv){
         if(!i4_acc512_selftest()) return 1;
         puts("AVX512 i4 selftest: ok"); return 0;
     }
+#endif
+#ifdef COLI_GGUF_RUNTIME_ENABLED
+    if(coli_gguf_cli_requested(argc,argv)) return coli_gguf_run_cli(argc,argv);
 #endif
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;
