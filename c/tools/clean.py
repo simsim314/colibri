@@ -13,10 +13,12 @@ FILES = [
     "olmoe", "olmoe.exe",
     "glm", "glm.exe",
     "iobench", "iobench.exe",
+    "gguf-inspect", "gguf-inspect.exe",
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",
+    "tests/test_gguf_reader", "tests/test_gguf_reader.exe",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
 ]
 # Test binaries match this pattern. Only remove executables (.exe on Windows,
