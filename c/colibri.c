@@ -52,6 +52,7 @@
 #endif
 #include "tok.h"
 #include "tier.h"
+#include "expert_scheduler.h"
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
@@ -257,6 +258,26 @@ typedef struct {
     uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
     uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
 } Model;
+
+static const ColiExpertSlotLayout g_eslot_layout = {
+    sizeof(ESlot), offsetof(ESlot, eid), offsetof(ESlot, used)
+};
+static ColiExpertLayerStore expert_store(Model *m, int layer) {
+    ColiExpertLayerStore s;
+    memset(&s, 0, sizeof(s));
+    s.pin = m->pin ? m->pin[layer] : NULL;
+    s.npin = m->npin ? m->npin[layer] : 0;
+    s.cache = m->ecache ? m->ecache[layer] : NULL;
+    s.ncache = m->ecn ? &m->ecn[layer] : NULL;
+    s.cache_cap = m->ecap;
+    s.n_experts = m->c.n_experts;
+    s.layout = g_eslot_layout;
+    s.clock = &m->eclock;
+    s.heat = m->eheat ? m->eheat[layer] : NULL;
+    s.last = m->elast ? m->elast[layer] : NULL;
+    s.access_clock = &m->eaccess_clock;
+    return s;
+}
 
 #include "quant.h"
 static int g_no_fused_pair=0;
@@ -634,10 +655,8 @@ static int g_route_call=0;
  * pilot ring (worker, residency re-check, safety invariants unchanged). Unlike PILOT,
  * no router matmul is needed — prediction is a table lookup on ids the layer just
  * produced. Hints only: a wrong prediction costs bandwidth, never output. */
-#define CP_M 16
 static int g_couple=0, g_couple_k=8, g_couple_d=1;
-static int16_t *cp_pred=NULL;    /* [(L*2+(dL-1))*E + e]*CP_M + j -> target id (-1 none) */
-static float   *cp_cnt=NULL;
+static ColiExpertCoupling g_coupling;
 static long g_cp_enq=0;
 /* All grammar-forced-draft state in one struct so it can become per-request
  * in the multiplexed server. Fields (same semantics as the former globals):
@@ -2712,11 +2731,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
  * nell'ordine (routed nel loro ordine di union, poi shared). */
 /* pin ∪ LRU residency probe (used by CACHE_ROUTE max-rank fill). */
 static int expert_is_resident(Model *m, int layer, int eid){
-    ESlot *P=m->pin[layer];
-    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid) return 1;
-    ESlot *Sl=m->ecache[layer];
-    for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
-    return 0;
+    ColiExpertLayerStore st=expert_store(m,layer);
+    return coli_expert_resident(&st,eid,0);
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
@@ -2924,7 +2940,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     free(rank_buf); free(rank_w);
     if(g_prof)m->t_route+=now_s()-route_t0;
     if(g_route_fp) g_route_call++;
-    if(g_couple && cp_pred && S<=8)
+    if(g_couple && g_coupling.pred && S<=8)
         for(int s2=0;s2<S;s2++) couple_prefetch(m,layer,idxs+(int64_t)s2*K,keff[s2]);
     if(g_looka && S==1 && layer<c->n_layers){
         int Ke=keff[0];
@@ -2967,14 +2983,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         /* residency pre-scan: which experts are already in pin or ecache (hits)? */
         unsigned char *is_hit=calloc(nu,1); int nhits=0;
-        for(int j=0;j<nu;j++){ int eid=uniq[j];
-            int found=0;
-            ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ found=1; break; }
-            if(!found){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ found=1; break; } }
-            if(found){ is_hit[j]=1; nhits++; }
-        }
+        { ColiExpertLayerStore st=expert_store(m,layer);
+          for(int j=0;j<nu;j++) if(coli_expert_resident(&st,uniq[j],0)){ is_hit[j]=1; nhits++; } }
         /* budget for misses = total budget - hits already kept (min 0) */
         int miss_budget = g_expert_budget - nhits; if(miss_budget<0) miss_budget=0;
         /* mark which unique experts to keep (1) or drop (0): keep all hits, fill rest
@@ -3032,11 +3042,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+        ColiExpertLayerStore estore=expert_store(m,layer);
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
-            ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_pin++; use[j]=&P[z]; break; }
-            if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; m->hit_ecache++; Sl[z].used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); use[j]=&Sl[z]; break; } }
+            ColiExpertLookup hit=coli_expert_lookup(&estore,eid,0);
+            if(hit.slot){ m->hits++; use[j]=(ESlot*)hit.slot;
+                if(hit.from_pin) m->hit_pin++; else { m->hit_ecache++; coli_expert_slot_touch(hit.slot,&estore.layout,estore.clock); } }
             if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
                 if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
         }
@@ -3118,13 +3128,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
         if(base+64<nu){
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
-            for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
-                ESlot *P=m->pin[layer];
-                for(int z=0;z<m->npin[layer] && !found;z++) if(P[z].eid==eid) found=1;
-                ESlot *Sl=m->ecache[layer];
-                for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
-                if(!found) expert_prefetch(m,layer,eid);
-            }
+            { ColiExpertLayerStore st=expert_store(m,layer);
+              for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j];
+                  if(!coli_expert_resident(&st,eid,0)) expert_prefetch(m,layer,eid);
+              } }
         }
 #ifdef COLI_CUDA
         ESlot *group_e[64]; int group_n[64]; int ngroup=0;
@@ -3489,12 +3496,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
          * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
+        { ColiExpertLayerStore st=expert_store(m,layer);   /* one shared admission/LRU policy */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
-          for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
-              if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
+          for(int a=0;a<promo;a++){ int q=nmiss-1-a; (void)coli_expert_promote_loaded(&st,&m->ws[q],NULL); }
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
@@ -3626,56 +3630,33 @@ static Model *pilot_m=NULL;
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
 static void pilot_realload(Model *m, int layer, int eid){
+    ColiExpertAdmission admission;
     pthread_mutex_lock(&g_pilot_mx);
     if(layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-        pthread_mutex_unlock(&g_pilot_mx); return;      /* il main possiede gia' questo layer */
+        pthread_mutex_unlock(&g_pilot_mx); return;
     }
-    ESlot *P=m->pin[layer];                             /* gia' residente (pin o ecache)? skip */
-    for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-    for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ pthread_mutex_unlock(&g_pilot_mx); return; }
-    int slot,isnew;                                     /* cresci se c'e' posto, altrimenti LRU */
-    if(nn<m->ecap){ slot=nn; isnew=1; }
-    else { int lru=0; for(int z=1;z<nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; slot=lru; isnew=0;
-        /* LFRU eviction guard (#441, fix #490): a speculation must not drop a WARM
-         * demand-loaded expert. We PROTECT the victim only when it is genuinely warm
-         * (>=2 demand accesses) AND clearly hotter than the speculation by tier_pick_lfru's
-         * 25%+4-freq hysteresis. The original #441 formula tested the speculation's score
-         * against victim+margin, which — because a speculation is by definition historically
-         * colder than a just-used demand expert — dropped ~all speculations once the cache
-         * was full, collapsing the LRU hit share (#490). Cache placement only -> output
-         * byte-identical (a dropped speculation is demand-loaded later, same value). */
-        if(g_pilot_evict_guard && m->eheat && m->elast && Sl[lru].eid>=0){
-            int vid=Sl[lru].eid; uint32_t vh=m->eheat[layer][vid];
-            if(vh>=2){
-                uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-                if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                            pthread_mutex_unlock(&g_pilot_mx); return; } } } }
-    ESlot *dst=&Sl[slot];
-    dst->eid=-1;                                        /* nascondi dagli scan-hint mentre carica */
+    ColiExpertLayerStore store=expert_store(m,layer);
+    if(!coli_expert_begin_admission(&store,eid,1,g_pilot_evict_guard,&admission)){
+        pthread_mutex_unlock(&g_pilot_mx); return;
+    }
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, sovrapposto al compute; fatal=0: un errore su una speculazione NON deve uccidere il server; demand=0: speculative, never classified */
+    int rc=expert_load(m,layer,eid,(ESlot*)admission.slot,0,0);
 
     pthread_mutex_lock(&g_pilot_mx);
-    if(rc==0){
-        dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
-        if(isnew) m->ecn[layer]=slot+1;                 /* pubblica lo slot SOLO ora che eid e' valido */
-        atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
-    } else {
-        atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); /* load fallito: slot resta nascosto (eid=-1), mai pubblicato */
-    }
+    coli_expert_finish_admission(&store,&admission,eid,rc==0);
+    if(rc==0) atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
+    else atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     g_pilot_inflight[layer]--;
     pthread_cond_broadcast(&g_pilot_cv);
     pthread_mutex_unlock(&g_pilot_mx);
-    if(rc!=0)                                            /* mai swallow silenzioso: logga (una riga) e prosegui */
+    if(rc!=0)
         fprintf(stderr,"[PILOT] load speculativo abbandonato: layer %d expert %d (I/O error/short read) — nessun impatto sull'output\n",layer,eid);
 }
 #ifdef __linux__
-typedef struct { int layer,eid,li; ESlot *dst; } PilotUringDone;
+typedef struct { int layer,eid,li; ColiExpertAdmission admission; } PilotUringDone;
 static void pilot_uring_batch(Model *m){
     PilotUringDone done[URING_LOAD_MAX]; int nd=0;
     uring_batch_reset(&g_ub_pilot);
@@ -3689,47 +3670,20 @@ static void pilot_uring_batch(Model *m){
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
             pthread_mutex_unlock(&g_pilot_mx); continue;
         }
-        int found=0; ESlot *P=m->pin[layer];
-        for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){found=1;break;}
-        ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-        for(int z=0;z<nn && !found;z++) if(Sl[z].eid==eid || Sl[z].eid==-(eid+2)) found=1;
-        if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
-        int slot;
-        if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else{
-            slot=-1;
-            for(int z=0;z<nn;z++){
-                if(Sl[z].eid==-1){ slot=z; break; }
-                if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
-                if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-            }
-            /* LFRU eviction guard (#441, fix #490): protect a WARM resident from a speculation.
-             * Same corrected test as pilot_realload: victim must be genuinely warm (>=2 accesses)
-             * AND clearly hotter (25%+4-freq hysteresis). See pilot_realload for the rationale and
-             * the #490 regression the original formula caused. */
-            if(slot>=0 && Sl[slot].eid>=0 && g_pilot_evict_guard && m->eheat && m->elast){
-                int vid=Sl[slot].eid; uint32_t vh=m->eheat[layer][vid];
-                if(vh>=2){
-                    uint64_t vs=tier_lfru_score(vh,m->elast[layer][vid],m->eaccess_clock);
-                    uint64_t cs=tier_lfru_score(m->eheat[layer][eid],m->elast[layer][eid],m->eaccess_clock);
-                    if(vs+(vs>>2)+(4u<<8)>cs){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                                                pthread_mutex_unlock(&g_pilot_mx); continue; }
-                }
-            }
+        ColiExpertLayerStore store=expert_store(m,layer); ColiExpertAdmission admission;
+        if(!coli_expert_begin_admission(&store,eid,1,g_pilot_evict_guard,&admission)){
+            pthread_mutex_unlock(&g_pilot_mx); continue;
         }
-        if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
-        ESlot *dst=&Sl[slot];
-        dst->eid=-(eid+2);                         /* visible reservation; never considered resident/evictable */
         g_pilot_inflight[layer]++;
         pthread_mutex_unlock(&g_pilot_mx);
 
-        int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0);
+        int li=uring_load_add(&g_ub_pilot,m,layer,eid,(ESlot*)admission.slot,0);
         if(li<0){
-            pthread_mutex_lock(&g_pilot_mx); dst->eid=-1; g_pilot_inflight[layer]--;
+            pthread_mutex_lock(&g_pilot_mx); coli_expert_finish_admission(&store,&admission,eid,0); g_pilot_inflight[layer]--;
             pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
             atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); continue;
         }
-        done[nd++]=(PilotUringDone){layer,eid,li,dst};
+        done[nd++]=(PilotUringDone){layer,eid,li,admission};
     }
     __atomic_store_n(&pilot_r,r,__ATOMIC_RELEASE);
     if(!nd) return;
@@ -3743,14 +3697,10 @@ static void pilot_uring_batch(Model *m){
         PilotUringDone *d=&done[i];
         int rc=uring_finalize_load(&g_ub_pilot,d->li,0);
         pthread_mutex_lock(&g_pilot_mx);
-        if(rc==0){
-            d->dst->eid=d->eid;
-            d->dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);
-            atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
-        }else{
-            d->dst->eid=-1;
-            atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-        }
+        ColiExpertLayerStore store=expert_store(m,d->layer);
+        coli_expert_finish_admission(&store,&d->admission,d->eid,rc==0);
+        if(rc==0) atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
+        else atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
         g_pilot_inflight[d->layer]--;
         pthread_cond_broadcast(&g_pilot_cv);
         pthread_mutex_unlock(&g_pilot_mx);
@@ -3779,70 +3729,32 @@ static void *pilot_worker(void *arg){
 /* parse .coli_pairs (see tools/route_pairs.py): "COLIPAIRS 1 <n>" then
  * "<L> <dL> <e> f:c f:c ..." lines. Needs c->n_experts/n_layers -> called post-init. */
 static void couple_load(Model *m, const char *path){
-    Cfg *c=&m->c; int E=c->n_experts, NL=c->n_layers;
-    FILE *f=fopen(path,"rb");
-    if(!f){ fprintf(stderr,"[COUPLE] cannot open %s\n",path); return; }
-    char magic[16]; int ver=0; long n=0;
-    if(fscanf(f,"%15s %d %ld",magic,&ver,&n)!=3 || strcmp(magic,"COLIPAIRS") || ver!=1){
-        fprintf(stderr,"[COUPLE] %s: bad header\n",path); fclose(f); return; }
-    size_t cells=(size_t)NL*2*E*CP_M;
-    cp_pred=malloc(cells*sizeof(int16_t)); cp_cnt=calloc(cells,sizeof(float));
-    if(!cp_pred||!cp_cnt){ fprintf(stderr,"[COUPLE] OOM\n"); free(cp_pred); free(cp_cnt); cp_pred=NULL; fclose(f); return; }
-    for(size_t i=0;i<cells;i++) cp_pred[i]=-1;
     long used=0;
-    char *ln=NULL; size_t lcap=0;
-    while(getline(&ln,&lcap,f)>0){          /* line-based: a malformed line cannot eat the next */
-        char *p=ln; int L,dL,e; int nc=0;
-        if(sscanf(p,"%d %d %d%n",&L,&dL,&e,&nc)!=3) continue;
-        p+=nc;
-        if(L<0||L>=NL||(dL!=1&&dL!=2)||e<0||e>=E) continue;
-        size_t base=((size_t)(L*2+(dL-1))*E+e)*CP_M;
-        int j=0;
-        while(j<CP_M){
-            int fe; float fc;
-            if(sscanf(p," %d:%f%n",&fe,&fc,&nc)!=2) break;
-            p+=nc;
-            if(fe>=0&&fe<E){ cp_pred[base+j]=(int16_t)fe; cp_cnt[base+j]=fc; j++; }
-        }
-        if(j) used++;
+    coli_expert_coupling_destroy(&g_coupling);
+    if(!coli_expert_coupling_load(&g_coupling,path,m->c.n_layers,m->c.n_experts,&used)){
+        fprintf(stderr,"[COUPLE] cannot load %s\n",path);return;
     }
-    free(ln);
-    fclose(f);
     g_couple=1;
     fprintf(stderr,"[COUPLE] %s: %ld conditioning entries, K=%d depth=%d\n",path,used,g_couple_k,g_couple_d);
 }
 /* score + enqueue: called from moe() after FASE A with the position's routed set */
 static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
-    Cfg *c=&m->c; int E=c->n_experts;
-    if(E>512) return;
+    Cfg *c=&m->c;
     if(!pilot_m){ pilot_m=m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
     for(int dL=1; dL<=g_couple_d; dL++){
         int lt=layer+dL;
         if(lt>=c->n_layers || !m->L[lt].sparse) continue;
-        float sc[512]; memset(sc,0,(size_t)E*sizeof(float));
-        for(int kk=0;kk<Ke;kk++){
-            size_t base=((size_t)(layer*2+(dL-1))*E+idx[kk])*CP_M;
-            for(int j=0;j<CP_M && cp_pred[base+j]>=0;j++) sc[cp_pred[base+j]]+=cp_cnt[base+j];
-        }
-        for(int kk=0;kk<g_couple_k;kk++){
-            int best=-1; float bv=0;
-            for(int e=0;e<E;e++) if(sc[e]>bv){bv=sc[e];best=e;}
-            if(best<0) break;
-            sc[best]=0;
-            int found=0;                            /* residency scan, same locking as pilot */
+        int pred[32];int n=coli_expert_coupling_predict(&g_coupling,layer,dL,idx,Ke,pred,g_couple_k<32?g_couple_k:32);
+        for(int kk=0;kk<n;kk++){
+            int best=pred[kk],found=0;
             pthread_mutex_lock(&g_pilot_mx);
-            ESlot *P=m->pin[lt];
-            for(int z=0;z<m->npin[lt] && !found;z++) if(P[z].eid==best) found=1;
-            ESlot *Sl=m->ecache[lt];
-            for(int z=0;z<m->ecn[lt] && !found;z++)
-                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
+            { ColiExpertLayerStore st=expert_store(m,lt); found=coli_expert_resident(&st,best,1); }
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
                     pilot_q[w&4095].l=lt; pilot_q[w&4095].e=best;
-                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
-                    g_cp_enq++;
+                    __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);g_cp_enq++;
                 }
             }
         }
@@ -3893,11 +3805,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
              * lock anyway, making a racing redundant enqueue harmless. */
             int found=0;
             pthread_mutex_lock(&g_pilot_mx);
-            ESlot *P=m->pin[lnext];
-            for(int z=0;z<m->npin[lnext] && !found;z++) if(P[z].eid==best) found=1;
-            ESlot *Sl=m->ecache[lnext];
-            for(int z=0;z<m->ecn[lnext] && !found;z++)
-                if(Sl[z].eid==best || Sl[z].eid==-(best+2)) found=1;
+            { ColiExpertLayerStore st=expert_store(m,lnext); found=coli_expert_resident(&st,best,1); }
             pthread_mutex_unlock(&g_pilot_mx);
             if(!found){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
@@ -5062,11 +4970,8 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
             }
         }
 #endif
-        ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
-        int np=m->npin[l]; if(np>4096) np=4096;
-        for(int z=0;z<np;z++) ids[z]=P[z].eid;
-        if(!tier_pick_lfru(m->eheat[l],m->elast[l],m->eaccess_clock,
-                           c->n_experts,ids,np,&zp,&eu,&g)) continue;
+        ColiExpertLayerStore st=expert_store(m,l); int zp,eu; long g;
+        if(!coli_expert_repin_pick(&st,&zp,&eu,&g)) continue;
         if(nb<maxc){ out[nb]=(RepinCand){g,l,zp,eu,0}; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
                if(g>out[w].gain) out[w]=(RepinCand){g,l,zp,eu,0}; }

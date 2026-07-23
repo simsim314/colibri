@@ -203,7 +203,7 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_gguf_reader$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
-TEST_BINS += tests/test_ggml_types$(EXE) tests/test_ggml_quants$(EXE) tests/test_tensor$(EXE) tests/test_f32_kernels$(EXE) tests/test_gguf_tokenizer$(EXE) tests/test_gguf_granite$(EXE)
+TEST_BINS += tests/test_ggml_types$(EXE) tests/test_ggml_quants$(EXE) tests/test_tensor$(EXE) tests/test_expert_scheduler$(EXE) tests/test_f32_kernels$(EXE) tests/test_gguf_tokenizer$(EXE) tests/test_gguf_granite$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -259,8 +259,8 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-GGUF_RUNTIME_SRC = gguf_granite.c gguf_tokenizer.c tensor.c ggml_quants.c ggml_types.c gguf_reader.c
-GGUF_RUNTIME_HDR = gguf_granite.h gguf_tokenizer.h tensor.h ggml_quants.h ggml_types.h gguf_reader.h f32_kernels.h
+GGUF_RUNTIME_SRC = gguf_granite.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c
+GGUF_RUNTIME_HDR = gguf_granite.h gguf_tokenizer.h tensor.h expert_scheduler.h ggml_quants.h ggml_types.h gguf_reader.h f32_kernels.h
 
 all: colibri$(EXE)
 
@@ -384,6 +384,10 @@ tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.c ggml_quants
 tests/test_tensor$(EXE): tests/test_tensor.c tensor.c tensor.h gguf_reader.c gguf_reader.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
 	$(CC) $(CFLAGS) tests/test_tensor.c tensor.c gguf_reader.c ggml_quants.c ggml_types.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
+
+tests/test_expert_scheduler$(EXE): tests/test_expert_scheduler.c expert_scheduler.c expert_scheduler.h tier.h
+	$(CC) $(CFLAGS) tests/test_expert_scheduler.c expert_scheduler.c -o $@ $(LDFLAGS)
+
 tests/test_f32_kernels$(EXE): tests/test_f32_kernels.c f32_kernels.h
 	$(CC) $(CFLAGS) tests/test_f32_kernels.c -o $@ $(LDFLAGS)
 
@@ -391,7 +395,7 @@ tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gg
 	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c -o $@ $(LDFLAGS)
 
 tests/test_gguf_granite$(EXE): tests/test_gguf_granite.c gguf_granite.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_tokenizer.c tensor.c ggml_quants.c ggml_types.c gguf_reader.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -419,45 +423,45 @@ tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h j
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_idot$(EXE): tests/test_idot.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_stops$(EXE): tests/test_stops.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_topp$(EXE): tests/test_topp.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c expert_scheduler.c expert_scheduler.h st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 # fmt=6 kernel oracle: needs the generated grid table, and its fixture comes from
 # the reference codec (tools/make_e8_fixture.py) — regenerate if the layout moves.
 tests/test_e8_kernel$(EXE): tests/test_e8_kernel.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_int3$(EXE): tests/test_int3.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -465,29 +469,29 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
-tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_idot$(EXE): tests/bench_idot.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
-tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_uring$(EXE): tests/test_uring.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
-tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c expert_scheduler.c expert_scheduler.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< expert_scheduler.c -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)

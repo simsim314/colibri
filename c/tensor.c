@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static int fail(char *error, size_t cap, const char *fmt, ...) {
     if (error && cap) {
@@ -132,6 +136,35 @@ int coli_tensor_is_resident(const ColiExec *exec, const ColiTensor *tensor) {
         return tensor->cuda && tensor->cuda_device == exec->device;
 #endif
     return 0;
+}
+
+void coli_tensor_release_backend(const ColiExec *exec, ColiTensor *tensor) {
+    if (!tensor || !exec || exec->kind == COLI_BACKEND_CPU) return;
+#ifdef COLI_CUDA
+    if (exec->kind == COLI_BACKEND_CUDA && tensor->cuda && tensor->owns_cuda &&
+        tensor->cuda_device == exec->device) {
+        coli_cuda_tensor_free(tensor->cuda);
+        tensor->cuda = NULL;
+        tensor->cuda_device = 0;
+        tensor->owns_cuda = 0;
+    }
+#else
+    (void)exec;
+#endif
+}
+
+void coli_tensor_prefetch_host(const ColiTensor *tensor) {
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if (!tensor || !tensor->mmap_backed || !tensor->data || !tensor->storage_bytes) return;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) page = 4096;
+    uintptr_t begin = (uintptr_t)tensor->data & ~((uintptr_t)page - 1u);
+    uintptr_t end = ((uintptr_t)tensor->data + (uintptr_t)tensor->storage_bytes +
+                     (uintptr_t)page - 1u) & ~((uintptr_t)page - 1u);
+    if (end > begin) (void)madvise((void *)begin, (size_t)(end - begin), MADV_WILLNEED);
+#else
+    (void)tensor;
+#endif
 }
 
 const void *coli_tensor_device_data(const ColiTensor *tensor) {

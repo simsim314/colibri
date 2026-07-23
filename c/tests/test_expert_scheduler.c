@@ -1,0 +1,65 @@
+#include "../expert_scheduler.h"
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct { int eid; int payload; uint64_t used; } Slot;
+typedef struct { int loads, evicts; } Ctx;
+
+static int load_cb(void *v,int layer,int eid,void *slot,int demand){
+    Ctx*c=(Ctx*)v;Slot*s=(Slot*)slot;(void)layer;(void)demand;c->loads++;s->payload=eid*10;return 1;
+}
+static void evict_cb(void*v,int layer,void*slot){Ctx*c=(Ctx*)v;(void)layer;c->evicts++;((Slot*)slot)->payload=0;}
+static size_t bytes_cb(void*v,int layer,const void*slot){(void)v;(void)layer;(void)slot;return sizeof(Slot);}
+
+int main(void){
+    Slot pin[1]={{1,10,1}}, cache[2]={{-1,0,0},{-1,0,0}};
+    int nc=0;uint64_t clock=1;uint32_t heat[8]={0},last[8]={0},ac=0;
+    uint32_t usage[8]={0};
+    ColiExpertLayerStore st={pin,1,cache,&nc,2,8,{sizeof(Slot),offsetof(Slot,eid),offsetof(Slot,used)},&clock,heat,last,usage,&ac};
+    ColiExpertStorageOps ops={load_cb,evict_cb,bytes_cb};Ctx ctx={0};ColiExpertSchedulerStats stats={0};
+    Slot*s=(Slot*)coli_expert_acquire(&st,0,1,1,1,&ops,&ctx,&stats);assert(s==&pin[0]);assert(stats.pin_hits==1);
+    s=(Slot*)coli_expert_acquire(&st,0,2,1,1,&ops,&ctx,&stats);assert(s&&s->eid==2&&s->payload==20&&nc==1);
+    s=(Slot*)coli_expert_acquire(&st,0,3,1,1,&ops,&ctx,&stats);assert(s&&s->eid==3&&nc==2);
+    /* Make expert 2 the LRU, then admit 4 and evict exactly one slot. */
+    cache[0].used=1;cache[1].used=20;
+    s=(Slot*)coli_expert_acquire(&st,0,4,1,1,&ops,&ctx,&stats);assert(s==&cache[0]&&s->eid==4);assert(ctx.evicts==1);
+    assert(heat[1]==1&&heat[2]==1&&heat[3]==1&&heat[4]==1);
+    assert(usage[1]==1&&usage[2]==1&&usage[3]==1&&usage[4]==1);
+    /* The shared PILOT guard protects a warm LRU victim from a cold speculation. */
+    cache[0].used=1;cache[1].used=20;heat[4]=20;last[4]=ac;heat[5]=0;last[5]=0;
+    ColiExpertAdmission a;assert(!coli_expert_begin_admission(&st,5,1,1,&a));
+    /* Guard-off preserves the old plain-LRU policy, and reservations prevent duplicates. */
+    assert(coli_expert_begin_admission(&st,5,1,0,&a));assert(coli_expert_resident(&st,5,1));
+    coli_expert_finish_admission(&st,&a,5,0);assert(!coli_expert_resident(&st,5,1));
+    /* REPIN selection is the same LFRU choice for every storage format. */
+    heat[1]=1;last[1]=1;heat[6]=100;last[6]=++ac;
+    int pin_index=-1,candidate=-1;long gain=0;
+    assert(coli_expert_repin_pick(&st,&pin_index,&candidate,&gain));
+    assert(pin_index==0&&candidate==6&&gain>0);
+
+    {
+        const char *path="tmp_expert_usage.txt";
+        uint32_t row0[8]={0},row1[8]={0};uint32_t*rows[2]={row0,row1};
+        row0[3]=7;row1[2]=11;row1[5]=4;
+        assert(coli_expert_usage_save(path,rows,2,8));
+        memset(row0,0,sizeof(row0));memset(row1,0,sizeof(row1));
+        assert(coli_expert_usage_load(path,rows,2,8)==22);
+        int ids[3]={-1,-1,-1};assert(coli_expert_usage_top(rows,2,8,ids,3)==3);
+        assert(ids[0]==10&&ids[1]==3&&ids[2]==13);
+        int64_t total=0;memset(ids,-1,sizeof(ids));
+        assert(coli_expert_usage_top_file(path,2,8,ids,2,&total)==2&&total==22);
+        assert(ids[0]==10&&ids[1]==3);remove(path);
+    }
+    {
+        const char *path="tmp_expert_pairs.txt";FILE*f=fopen(path,"w");assert(f);
+        fputs("COLIPAIRS 1 2\n0 1 2 5:3.0 6:1.0\n0 1 3 6:4.0 5:1.0\n",f);fclose(f);
+        ColiExpertCoupling cp={0};long used=0;assert(coli_expert_coupling_load(&cp,path,2,8,&used));assert(used==2);
+        int routed[2]={2,3},pred[2]={-1,-1};int pn=coli_expert_coupling_predict(&cp,0,1,routed,2,pred,2);
+        assert(pn==2&&pred[0]==6&&pred[1]==5);coli_expert_coupling_destroy(&cp);remove(path);
+    }
+    printf("test_expert_scheduler: one policy for pin/LRU/admission/eviction/REPIN/coupling/usage ok\n");
+    return 0;
+}

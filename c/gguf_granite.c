@@ -2,6 +2,7 @@
 #include "tensor.h"
 #include "gguf_tokenizer.h"
 #include "f32_kernels.h"
+#include "expert_scheduler.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -21,10 +22,23 @@ static int omp_get_max_threads(void) { return 1; }
 #endif
 
 typedef struct {
+    int eid;
+    ColiTensor *gate, *up, *down;
+    uint64_t used;
+} GraniteExpertSlot;
+
+static const ColiExpertSlotLayout g_granite_slot_layout = {
+    sizeof(GraniteExpertSlot), offsetof(GraniteExpertSlot, eid), offsetof(GraniteExpertSlot, used)
+};
+
+typedef struct {
     ColiTensor attn_norm, q, k, v, o;
     ColiTensor ffn_norm, router, gate, up, down;
     ColiTensor *gate_expert, *up_expert, *down_expert;
     int expert_views;
+    GraniteExpertSlot *pin, *cache;
+    int npin, ncache, cache_cap;
+    uint32_t *heat, *last, *usage;
 } GraniteLayer;
 
 typedef struct {
@@ -42,7 +56,18 @@ typedef struct {
     int context_capacity;
     float *k_cache, *v_cache;
     float *k_cache_dev, *v_cache_dev;
-    size_t cuda_weight_bytes;
+    size_t cuda_weight_bytes, cuda_dense_bytes, cuda_expert_bytes;
+    size_t expert_bytes;
+    uint64_t expert_clock;
+    uint32_t expert_access_clock;
+    ColiExpertSchedulerStats scheduler_stats;
+    int scheduler_evict_guard;
+    int repin_interval, tokens_since_repin;
+    int pilot, pilot_real, pilot_k;
+    int couple, couple_k, couple_d;
+    ColiExpertCoupling coupling;
+    char usage_path[2048];
+    int64_t usage_history;
     int verbose;
     ColiExec exec;
 } GraniteModel;
@@ -107,6 +132,7 @@ static void layer_free(GraniteLayer *l) {
         tensor_free(&l->gate_expert[e]); tensor_free(&l->up_expert[e]); tensor_free(&l->down_expert[e]);
     }
     free(l->gate_expert); free(l->up_expert); free(l->down_expert);
+    free(l->pin); free(l->cache); free(l->heat); free(l->last); free(l->usage);
     tensor_free(&l->attn_norm); tensor_free(&l->q); tensor_free(&l->k); tensor_free(&l->v); tensor_free(&l->o);
     tensor_free(&l->ffn_norm); tensor_free(&l->router); tensor_free(&l->gate); tensor_free(&l->up); tensor_free(&l->down);
 }
@@ -119,6 +145,7 @@ static void model_free(GraniteModel *m) {
     if (m->v_cache_dev) coli_cuda_pipe_free(m->exec.device,m->v_cache_dev);
 #endif
     free(m->k_cache); free(m->v_cache); free(m->architecture);
+    coli_expert_coupling_destroy(&m->coupling);
     coli_gguf_tokenizer_destroy(m->tokenizer); coli_gguf_close(&m->gguf);
     memset(m,0,sizeof(*m));
 }
@@ -231,16 +258,17 @@ static int model_load_weights(GraniteModel *m, char *err, size_t cap) {
 static int model_reside_cuda(GraniteModel *m,char *err,size_t cap){
     if(m->exec.kind!=COLI_BACKEND_CUDA)return 1;
 #ifdef COLI_CUDA
-#define RESIDE(t) do{if(!coli_tensor_reside(&m->exec,(t)))return errf(err,cap,"CUDA residency failed for %s",(t)->name?(t)->name:"<unnamed>");m->cuda_weight_bytes+=(t)->storage_bytes;}while(0)
-    RESIDE(&m->token_embd); RESIDE(&m->output_norm); if(!m->tied_output)RESIDE(&m->output);
+#define RESIDE_DENSE(t) do{if(!coli_tensor_reside(&m->exec,(t)))return errf(err,cap,"CUDA residency failed for %s",(t)->name?(t)->name:"<unnamed>");m->cuda_dense_bytes+=(t)->storage_bytes;}while(0)
+    RESIDE_DENSE(&m->token_embd); RESIDE_DENSE(&m->output_norm); if(!m->tied_output)RESIDE_DENSE(&m->output);
     for(int l=0;l<m->n_layers;l++){
         GraniteLayer *x=&m->layers[l];
-        RESIDE(&x->attn_norm);RESIDE(&x->q);RESIDE(&x->k);RESIDE(&x->v);RESIDE(&x->o);
-        RESIDE(&x->ffn_norm);RESIDE(&x->router);RESIDE(&x->gate);RESIDE(&x->up);RESIDE(&x->down);
-        if(m->verbose)fprintf(stderr,"[CUDA] resident layer %d/%d\r",l+1,m->n_layers);
+        RESIDE_DENSE(&x->attn_norm);RESIDE_DENSE(&x->q);RESIDE_DENSE(&x->k);RESIDE_DENSE(&x->v);RESIDE_DENSE(&x->o);
+        RESIDE_DENSE(&x->ffn_norm);RESIDE_DENSE(&x->router);
+        if(m->verbose)fprintf(stderr,"[CUDA] dense resident layer %d/%d\r",l+1,m->n_layers);
     }
     if(m->verbose)fputc('\n',stderr);
-#undef RESIDE
+#undef RESIDE_DENSE
+    m->cuda_weight_bytes=m->cuda_dense_bytes;
     return 1;
 #else
     return errf(err,cap,"CUDA backend unavailable");
@@ -253,7 +281,10 @@ static int model_build_expert_views(GraniteModel *m,char *err,size_t cap){
         x->gate_expert=(ColiTensor*)calloc((size_t)m->n_experts,sizeof(ColiTensor));
         x->up_expert=(ColiTensor*)calloc((size_t)m->n_experts,sizeof(ColiTensor));
         x->down_expert=(ColiTensor*)calloc((size_t)m->n_experts,sizeof(ColiTensor));
-        if(!x->gate_expert||!x->up_expert||!x->down_expert)
+        x->heat=(uint32_t*)calloc((size_t)m->n_experts,sizeof(uint32_t));
+        x->last=(uint32_t*)calloc((size_t)m->n_experts,sizeof(uint32_t));
+        x->usage=(uint32_t*)calloc((size_t)m->n_experts,sizeof(uint32_t));
+        if(!x->gate_expert||!x->up_expert||!x->down_expert||!x->heat||!x->last||!x->usage)
             return errf(err,cap,"out of memory allocating native expert views");
         for(int e=0;e<m->n_experts;e++){
             if(!coli_tensor_rows_view(&x->gate,(uint64_t)e*m->expert_ff,(uint64_t)m->expert_ff,&x->gate_expert[e])||
@@ -265,7 +296,211 @@ static int model_build_expert_views(GraniteModel *m,char *err,size_t cap){
             x->expert_views=e+1;
         }
     }
+    if(m->n_layers>0&&m->n_experts>0){GraniteLayer*x=&m->layers[0];
+        m->expert_bytes=(size_t)x->gate_expert[0].storage_bytes+(size_t)x->up_expert[0].storage_bytes+(size_t)x->down_expert[0].storage_bytes;}
     return 1;
+}
+
+static ColiExpertLayerStore granite_store(GraniteModel*m,int layer){
+    GraniteLayer*l=&m->layers[layer];ColiExpertLayerStore s;memset(&s,0,sizeof(s));
+    s.pin=l->pin;s.npin=l->npin;s.cache=l->cache;s.ncache=&l->ncache;s.cache_cap=l->cache_cap;
+    s.n_experts=m->n_experts;s.layout=g_granite_slot_layout;s.clock=&m->expert_clock;
+    s.heat=l->heat;s.last=l->last;s.usage=l->usage;s.access_clock=&m->expert_access_clock;return s;
+}
+static void granite_slot_bind(GraniteModel*m,int layer,int eid,GraniteExpertSlot*s){
+    GraniteLayer*l=&m->layers[layer];s->eid=eid;s->gate=&l->gate_expert[eid];s->up=&l->up_expert[eid];s->down=&l->down_expert[eid];
+}
+static int granite_storage_load(void*ctx,int layer,int eid,void*slot,int demand){
+    GraniteModel*m=(GraniteModel*)ctx;GraniteExpertSlot*s=(GraniteExpertSlot*)slot;(void)demand;
+    granite_slot_bind(m,layer,eid,s);coli_tensor_prefetch_host(s->gate);coli_tensor_prefetch_host(s->up);coli_tensor_prefetch_host(s->down);
+    if(m->exec.kind==COLI_BACKEND_CUDA){
+        if(!coli_tensor_reside(&m->exec,s->gate)||!coli_tensor_reside(&m->exec,s->up)||!coli_tensor_reside(&m->exec,s->down)){
+            coli_tensor_release_backend(&m->exec,s->gate);coli_tensor_release_backend(&m->exec,s->up);coli_tensor_release_backend(&m->exec,s->down);
+            s->eid=-1;s->gate=s->up=s->down=NULL;return 0;
+        }
+        m->cuda_expert_bytes+=m->expert_bytes;m->cuda_weight_bytes=m->cuda_dense_bytes+m->cuda_expert_bytes;
+    }
+    return 1;
+}
+static void granite_storage_evict(void*ctx,int layer,void*slot){
+    GraniteModel*m=(GraniteModel*)ctx;GraniteExpertSlot*s=(GraniteExpertSlot*)slot;(void)layer;
+    if(s->eid>=0&&m->exec.kind==COLI_BACKEND_CUDA){
+        coli_tensor_release_backend(&m->exec,s->gate);coli_tensor_release_backend(&m->exec,s->up);coli_tensor_release_backend(&m->exec,s->down);
+        if(m->cuda_expert_bytes>=m->expert_bytes)m->cuda_expert_bytes-=m->expert_bytes;
+        m->cuda_weight_bytes=m->cuda_dense_bytes+m->cuda_expert_bytes;
+    }
+    s->eid=-1;s->gate=s->up=s->down=NULL;s->used=0;
+}
+static size_t granite_storage_bytes(void*ctx,int layer,const void*slot){(void)layer;(void)slot;return ((GraniteModel*)ctx)->expert_bytes;}
+static const ColiExpertStorageOps g_granite_storage={granite_storage_load,granite_storage_evict,granite_storage_bytes};
+
+static void granite_usage_path(GraniteModel *m, const char *model_path) {
+    if (!m || !model_path) return;
+    const size_t n = strlen(model_path);
+    if (n + sizeof(".coli_usage") > sizeof(m->usage_path)) return;
+    memcpy(m->usage_path, model_path, n);
+    memcpy(m->usage_path + n, ".coli_usage", sizeof(".coli_usage"));
+}
+static void granite_usage_rows(GraniteModel *m, uint32_t **rows) {
+    for (int l = 0; l < m->n_layers; ++l) rows[l] = m->layers[l].usage;
+}
+static int64_t granite_usage_load(GraniteModel *m, const char *model_path) {
+    granite_usage_path(m, model_path);
+    if (!m->usage_path[0]) return 0;
+    uint32_t **rows = (uint32_t **)malloc((size_t)m->n_layers * sizeof(*rows));
+    if (!rows) return 0;
+    granite_usage_rows(m, rows);
+    const int64_t total = coli_expert_usage_load(m->usage_path, rows, m->n_layers, m->n_experts);
+    free(rows);
+    m->usage_history = total;
+    return total;
+}
+static void granite_usage_save(GraniteModel *m) {
+    if (!m || !m->usage_path[0] || !m->layers) return;
+    uint32_t **rows = (uint32_t **)malloc((size_t)m->n_layers * sizeof(*rows));
+    if (!rows) return;
+    granite_usage_rows(m, rows);
+    if (!coli_expert_usage_save(m->usage_path, rows, m->n_layers, m->n_experts) && m->verbose)
+        fprintf(stderr, "[USAGE] cannot save %s\n", m->usage_path);
+    free(rows);
+}
+static int granite_usage_top(GraniteModel *m, int *ids, int cap) {
+    uint32_t **rows = (uint32_t **)malloc((size_t)m->n_layers * sizeof(*rows));
+    if (!rows) return 0;
+    granite_usage_rows(m, rows);
+    const int n = coli_expert_usage_top(rows, m->n_layers, m->n_experts, ids, cap);
+    free(rows);
+    return n;
+}
+static int granite_stats_fallback(GraniteModel *m, char *path, size_t cap) {
+    if (!m->usage_path[0] || !path || cap == 0) return 0;
+    const char *slash = strrchr(m->usage_path, '/');
+    if (!slash) return snprintf(path, cap, "stats.txt") > 0;
+    const size_t dir = (size_t)(slash - m->usage_path);
+    if (dir + sizeof("/stats.txt") > cap) return 0;
+    memcpy(path, m->usage_path, dir);
+    memcpy(path + dir, "/stats.txt", sizeof("/stats.txt"));
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); const long size = ftell(f); fclose(f);
+    return size > 0;
+}
+static int granite_scheduler_init(GraniteModel*m,char*err,size_t cap){
+    m->scheduler_evict_guard=getenv("PILOT_EVICT_GUARD")?atoi(getenv("PILOT_EVICT_GUARD")):1;
+    m->repin_interval=getenv("REPIN")?atoi(getenv("REPIN")):0;
+    m->pilot=getenv("PILOT")?atoi(getenv("PILOT")):0;
+    m->pilot_real=getenv("PILOT_REAL")?atoi(getenv("PILOT_REAL")):0;
+    if(m->pilot_real)m->pilot=1;
+    m->pilot_k=getenv("PILOT_K")?atoi(getenv("PILOT_K")):(m->pilot_real?6:8);
+    if(m->pilot_k<1)m->pilot_k=1;
+    if(m->pilot_k>m->n_experts)m->pilot_k=m->n_experts;
+    m->couple_k=getenv("COUPLE_K")?atoi(getenv("COUPLE_K")):8;if(m->couple_k<1)m->couple_k=1;if(m->couple_k>32)m->couple_k=32;
+    m->couple_d=getenv("COUPLE_D")?atoi(getenv("COUPLE_D")):1;if(m->couple_d<1)m->couple_d=1;if(m->couple_d>2)m->couple_d=2;
+    if(getenv("COUPLE")&&*getenv("COUPLE")){long used=0;m->couple=coli_expert_coupling_load(&m->coupling,getenv("COUPLE"),m->n_layers,m->n_experts,&used);
+        if(m->verbose)fprintf(stderr,"[COUPLE] GGUF %s: %ld conditioning entries, K=%d depth=%d\n",getenv("COUPLE"),used,m->couple_k,m->couple_d);}
+    const int total=m->n_layers*m->n_experts;int slots=total;
+#ifdef COLI_CUDA
+    if(m->exec.kind==COLI_BACKEND_CUDA){
+        size_t free_b=0,total_b=0;double reserve=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):0.5;
+        double budget=getenv("CUDA_EXPERT_GB")?atof(getenv("CUDA_EXPERT_GB"))*1e9:-1.0;
+        if(budget<0&&coli_cuda_mem_info(m->exec.device,&free_b,&total_b))budget=(double)free_b-reserve*1e9;
+        if(budget<0)budget=0;
+        slots=m->expert_bytes?(int)(budget/(double)m->expert_bytes):0;
+        if(slots>total)slots=total;
+        if(slots<m->n_layers)return errf(err,cap,"CUDA expert budget fits %d slots; need at least %d (set CUDA_EXPERT_GB or reduce CUDA_RESERVE_GB)",slots,m->n_layers);
+    }
+#endif
+    int pin_total=slots==total?total:0;const char*pinfile=getenv("PIN");int*pinids=NULL,npinids=0;
+    if(slots<total){
+        const int maxpins=slots>m->n_layers?slots-m->n_layers:0;
+        int want=0;char auto_stats[2048];const char*source=pinfile;
+        if(pinfile){
+            const char*pgs=getenv("PIN_GB");
+            if(pgs&&!strcmp(pgs,"all"))want=maxpins;
+            else if(pgs&&atof(pgs)>0&&m->expert_bytes)want=(int)(atof(pgs)*1e9/m->expert_bytes);
+            else want=slots/2;
+            if(want>maxpins)want=maxpins;
+            if(want<0)want=0;
+            if(!strcmp(pinfile,"auto")){
+                if(m->usage_history>0)source=m->usage_path;
+                else if(granite_stats_fallback(m,auto_stats,sizeof(auto_stats)))source=auto_stats;
+                else source=NULL;
+            }
+        }else{
+            const int autopin=getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
+            if(autopin&&m->usage_history>=5000){
+                double confidence=(double)m->usage_history/200000.0;if(confidence>1.0)confidence=1.0;
+                want=(int)(0.5*confidence*slots);if(want>maxpins)want=maxpins;
+                source=m->usage_path;
+            }
+        }
+        if(want>0&&source){
+            pinids=(int*)malloc((size_t)want*sizeof(int));
+            if(!pinids)return errf(err,cap,"scheduler pin ranking OOM");
+            if(source==m->usage_path)npinids=granite_usage_top(m,pinids,want);
+            else npinids=coli_expert_usage_top_file(source,m->n_layers,m->n_experts,pinids,want,NULL);
+            pin_total=npinids;
+            if(m->verbose)fprintf(stderr,"[PIN] GGUF: %d experts from %s\n",npinids,source);
+        }else if(pinfile&&m->verbose)fprintf(stderr,"[PIN] GGUF: no usable history for %s\n",pinfile);
+    }
+    int*pc=(int*)calloc((size_t)m->n_layers,sizeof(int));if(!pc){free(pinids);return errf(err,cap,"scheduler OOM");}
+    if(pin_total==total)for(int l=0;l<m->n_layers;l++)pc[l]=m->n_experts;else for(int i=0;i<npinids;i++)pc[pinids[i]/m->n_experts]++;
+    int cache_slots=slots-pin_total,base=cache_slots/m->n_layers,extra=cache_slots%m->n_layers;
+    for(int l=0;l<m->n_layers;l++){
+        GraniteLayer*x=&m->layers[l];x->npin=pc[l];x->cache_cap=base+(l<extra);if(x->npin)x->pin=(GraniteExpertSlot*)calloc((size_t)x->npin,sizeof(*x->pin));if(x->cache_cap)x->cache=(GraniteExpertSlot*)calloc((size_t)x->cache_cap,sizeof(*x->cache));
+        if((x->npin&&!x->pin)||(x->cache_cap&&!x->cache)){free(pc);free(pinids);return errf(err,cap,"scheduler slot OOM");}
+        for(int z=0;z<x->npin;z++)x->pin[z].eid=-1;
+        for(int z=0;z<x->cache_cap;z++)x->cache[z].eid=-1;
+    }
+    if(pin_total==total){for(int l=0;l<m->n_layers;l++)for(int e=0;e<m->n_experts;e++){GraniteExpertSlot*q=&m->layers[l].pin[e];if(!granite_storage_load(m,l,e,q,0)){free(pc);free(pinids);return errf(err,cap,"expert pin residency failed");}q->used=++m->expert_clock;}}
+    else{int*next=(int*)calloc((size_t)m->n_layers,sizeof(int));for(int i=0;i<npinids;i++){int l=pinids[i]/m->n_experts,e=pinids[i]%m->n_experts;GraniteExpertSlot*q=&m->layers[l].pin[next[l]++];if(!granite_storage_load(m,l,e,q,0)){free(next);free(pc);free(pinids);return errf(err,cap,"expert pin residency failed");}q->used=++m->expert_clock;}free(next);}
+    free(pc);free(pinids);
+    if(m->verbose)fprintf(stderr,"[SCHED] one native scheduler: %d pin + %d LRU expert slots, %.2f MiB/slot%s; REPIN=%d PILOT=%s COUPLE=%s\n",
+        pin_total,cache_slots,m->expert_bytes/(1024.0*1024.0),slots==total?", all experts resident":"",
+        m->repin_interval,m->pilot?(m->pilot_real?"real":"hint"):"off",m->couple?"on":"off");
+    return 1;
+}
+static GraniteExpertSlot*granite_expert_acquire(GraniteModel*m,int layer,int eid,int demand){
+    ColiExpertLayerStore st=granite_store(m,layer);
+    return (GraniteExpertSlot*)coli_expert_acquire(&st,layer,eid,demand,m->scheduler_evict_guard,&g_granite_storage,m,&m->scheduler_stats);
+}
+static void granite_prefetch_ids(GraniteModel*m,int layer,const int*ids,int n){
+    if(layer<0||layer>=m->n_layers)return;
+    GraniteLayer*l=&m->layers[layer];
+    for(int i=0;i<n;i++){
+        const int eid=ids[i];if(eid<0||eid>=m->n_experts)continue;
+        if(m->pilot_real)(void)granite_expert_acquire(m,layer,eid,0);
+        else{
+            coli_tensor_prefetch_host(&l->gate_expert[eid]);
+            coli_tensor_prefetch_host(&l->up_expert[eid]);
+            coli_tensor_prefetch_host(&l->down_expert[eid]);
+        }
+    }
+}
+static void granite_couple_prefetch(GraniteModel*m,int layer,const int*routed,int nrouted){
+    if(!m->couple)return;
+    for(int d=1;d<=m->couple_d;d++){int target=layer+d;if(target>=m->n_layers)break;int pred[32];
+        int n=coli_expert_coupling_predict(&m->coupling,layer,d,routed,nrouted,pred,m->couple_k);
+        granite_prefetch_ids(m,target,pred,n);}
+}
+static void granite_repin(GraniteModel*m){
+    if(m->repin_interval<=0||++m->tokens_since_repin<m->repin_interval)return;
+    m->tokens_since_repin=0;
+    for(int l=0;l<m->n_layers;l++){
+        ColiExpertLayerStore st=granite_store(m,l);int pi,e;long gain;
+        if(!coli_expert_repin_pick(&st,&pi,&e,&gain))continue;
+        GraniteExpertSlot*q=&m->layers[l].pin[pi];const int old=q->eid;
+        granite_storage_evict(m,l,q);
+        if(granite_storage_load(m,l,e,q,0)){
+            q->used=++m->expert_clock;
+            if(m->verbose)fprintf(stderr,"[REPIN] GGUF layer %d: %d <- %d (gain %ld)\n",l,old,e,gain);
+        }else if(old>=0){
+            (void)granite_storage_load(m,l,old,q,0);
+            q->used=++m->expert_clock;
+            if(m->verbose)fprintf(stderr,"[REPIN] GGUF layer %d: upload of %d failed; restored %d\n",l,e,old);
+        }
+        coli_expert_decay_heat(&st);
+    }
 }
 
 static int alloc_cache(GraniteModel *m, int context, char *err, size_t cap) {
@@ -367,14 +602,20 @@ static int model_forward_cpu(GraniteModel*m,GraniteScratch*s,int token,int pos,c
         coli_f32_rmsnorm(s->norm,s->ffn_in,s->weight,m->hidden,m->eps);
         if(!tensor_mm(m,s->router,s->norm,&L->router,m->hidden,m->n_experts,err,cap))return 0;
         const int nk=coli_f32_router_topk(s->router,m->n_experts,m->n_expert_used,s->top_idx,s->top_w);
+        granite_couple_prefetch(m,l,s->top_idx,nk);
+        if(m->pilot&&l+1<m->n_layers){int pidx[64];float pw[64];int keep=m->pilot_k<64?m->pilot_k:64;
+            if(tensor_mm(m,s->router,s->norm,&m->layers[l+1].router,m->hidden,m->n_experts,err,cap)){
+                int pn=coli_f32_router_topk(s->router,m->n_experts,keep,pidx,pw);granite_prefetch_ids(m,l+1,pidx,pn);
+            }else return 0;}
         memset(s->moe,0,(size_t)m->hidden*sizeof(float));
         for(int j=0;j<nk;j++){
             const int e=s->top_idx[j];const float rw=s->top_w[j]*m->expert_weights_scale;
-            ColiTensor *gate=&L->gate_expert[e],*up=&L->up_expert[e],*down=&L->down_expert[e];
-            if(!tensor_mm(m,s->gate,s->norm,gate,m->hidden,m->expert_ff,err,cap))return 0;
-            if(!tensor_mm(m,s->up,s->norm,up,m->hidden,m->expert_ff,err,cap))return 0;
+            GraniteExpertSlot *slot=granite_expert_acquire(m,l,e,1);
+            if(!slot)return errf(err,cap,"expert scheduler admission failed at layer %d expert %d",l,e);
+            if(!tensor_mm(m,s->gate,s->norm,slot->gate,m->hidden,m->expert_ff,err,cap))return 0;
+            if(!tensor_mm(m,s->up,s->norm,slot->up,m->hidden,m->expert_ff,err,cap))return 0;
             for(int i=0;i<m->expert_ff;i++)s->gate[i]=coli_f32_silu(s->gate[i])*s->up[i];
-            if(!tensor_mm(m,s->expert_out,s->gate,down,m->expert_ff,m->hidden,err,cap))return 0;
+            if(!tensor_mm(m,s->expert_out,s->gate,slot->down,m->expert_ff,m->hidden,err,cap))return 0;
             for(int i=0;i<m->hidden;i++)s->moe[i]+=rw*s->expert_out[i];
         }
         for(int i=0;i<m->hidden;i++)s->x[i]=s->ffn_in[i]+m->residual_scale*s->moe[i];
@@ -433,13 +674,21 @@ static int model_forward_cuda(GraniteModel*m,GraniteScratch*s,int token,int pos,
            !coli_cuda_pipe_download(dev,s->drouter,s->router,(size_t)m->n_experts*sizeof(float)))
             return errf(err,cap,"CUDA router failed");
         const int nk=coli_f32_router_topk(s->router,m->n_experts,m->n_expert_used,s->top_idx,s->top_w);
+        granite_couple_prefetch(m,l,s->top_idx,nk);
+        if(m->pilot&&l+1<m->n_layers){int pidx[64];float pw[64];int keep=m->pilot_k<64?m->pilot_k:64;
+            if(!tensor_mm_device(m,s->drouter,s->dnorm,&m->layers[l+1].router,err,cap)||
+               !coli_cuda_pipe_download(dev,s->drouter,s->router,(size_t)m->n_experts*sizeof(float)))
+                return errf(err,cap,"CUDA PILOT router failed at layer %d",l);
+            int pn=coli_f32_router_topk(s->router,m->n_experts,keep,pidx,pw);granite_prefetch_ids(m,l+1,pidx,pn);}
         if(!coli_cuda_pipe_zero(dev,s->dmoe,(size_t)H))return errf(err,cap,"CUDA MoE zero failed");
         for(int j=0;j<nk;j++){
             const int e=s->top_idx[j];const float rw=s->top_w[j]*m->expert_weights_scale;
-            if(!tensor_mm_device(m,s->dgate,s->dnorm,&L->gate_expert[e],err,cap)||
-               !tensor_mm_device(m,s->dup,s->dnorm,&L->up_expert[e],err,cap)||
+            GraniteExpertSlot *slot=granite_expert_acquire(m,l,e,1);
+            if(!slot)return errf(err,cap,"expert scheduler admission failed at layer %d expert %d",l,e);
+            if(!tensor_mm_device(m,s->dgate,s->dnorm,slot->gate,err,cap)||
+               !tensor_mm_device(m,s->dup,s->dnorm,slot->up,err,cap)||
                !coli_cuda_pipe_silu_mul(dev,s->dgate,s->dup,(size_t)m->expert_ff)||
-               !tensor_mm_device(m,s->dexpert_out,s->dgate,&L->down_expert[e],err,cap)||
+               !tensor_mm_device(m,s->dexpert_out,s->dgate,slot->down,err,cap)||
                !coli_cuda_pipe_axpy(dev,s->dmoe,s->dexpert_out,rw,(size_t)H))
                 return errf(err,cap,"CUDA expert %d failed at layer %d",e,l);
         }
@@ -458,10 +707,14 @@ static int model_forward_cuda(GraniteModel*m,GraniteScratch*s,int token,int pos,
 #endif
 
 static int model_forward(GraniteModel*m,GraniteScratch*s,int token,int pos,char*err,size_t cap){
+    int ok;
 #ifdef COLI_CUDA
-    if(m->exec.kind==COLI_BACKEND_CUDA)return model_forward_cuda(m,s,token,pos,err,cap);
+    if(m->exec.kind==COLI_BACKEND_CUDA)ok=model_forward_cuda(m,s,token,pos,err,cap);
+    else
 #endif
-    return model_forward_cpu(m,s,token,pos,err,cap);
+    ok=model_forward_cpu(m,s,token,pos,err,cap);
+    if(ok)granite_repin(m);
+    return ok;
 }
 
 static int argmax(const float*x,int n){int b=0;for(int i=1;i<n;i++)if(x[i]>x[b])b=i;return b;}
@@ -474,11 +727,14 @@ static int load_model(GraniteModel*m,const char*path,int context,int verbose,Col
     if(coli_gguf_tokenizer_vocab_size(m->tokenizer)!=m->vocab)return errf(err,cap,"tokenizer/model vocabulary mismatch");
     const double t0=now_sec();if(!model_load_weights(m,err,cap))return 0;
     const double mapped_s=now_sec()-t0,t1=now_sec();
-    if(!model_reside_cuda(m,err,cap)||!model_build_expert_views(m,err,cap)||!alloc_cache(m,context,err,cap))return 0;
+    if(!model_build_expert_views(m,err,cap)||!model_reside_cuda(m,err,cap))return 0;
+    const int64_t history=granite_usage_load(m,path);
+    if(history>0&&verbose)fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)history,m->usage_path);
+    if(!granite_scheduler_init(m,err,cap)||!alloc_cache(m,context,err,cap))return 0;
     if(verbose){
         fprintf(stderr,"[GGUF] granitemoe: layers=%d hidden=%d heads=%d/%d experts=%d top=%d vocab=%d\n",
             m->n_layers,m->hidden,m->n_heads,m->n_kv_heads,m->n_experts,m->n_expert_used,m->vocab);
-        if(exec.kind==COLI_BACKEND_CUDA)fprintf(stderr,"[GGUF] mapped in %.2fs; native encoded residency %.2fs, %.2f MiB; backend=cuda (resident pipeline); context=%d\n",
+        if(exec.kind==COLI_BACKEND_CUDA)fprintf(stderr,"[GGUF] mapped in %.2fs; scheduled native residency %.2fs, %.2f MiB; backend=cuda (Colibri scheduler); context=%d\n",
             mapped_s,now_sec()-t1,m->cuda_weight_bytes/(1024.0*1024.0),context);
         else fprintf(stderr,"[GGUF] mapped quantized weights in %.2fs; backend=cpu (direct mmap); context=%d; threads=%d\n",
             mapped_s,context,omp_get_max_threads());
@@ -560,15 +816,20 @@ int coli_gguf_run_cli(int argc,char**argv){
         if(!model_forward(&m,&s,next,pos++,err,sizeof(err))){fprintf(stderr,"\n%s\n",err);goto fail;}
     }
     fputc('\n',stdout);
-    if(verbose)fprintf(stderr,"[GGUF] prompt=%d generated=%d elapsed=%.2fs (%.3f tok/s decode+prefill)\n",n_prompt,generated,now_sec()-t0,
+    if(verbose){fprintf(stderr,"[GGUF] prompt=%d generated=%d elapsed=%.2fs (%.3f tok/s decode+prefill)\n",n_prompt,generated,now_sec()-t0,
         (n_prompt+generated)/(now_sec()-t0));
-    scratch_free(&s);model_free(&m);free(ids);
+        fprintf(stderr,"[SCHED] hits=%llu (pin=%llu LRU=%llu) misses=%llu admissions=%llu evictions=%llu speculative=%llu/%llu\n",
+            (unsigned long long)m.scheduler_stats.hits,(unsigned long long)m.scheduler_stats.pin_hits,
+            (unsigned long long)m.scheduler_stats.cache_hits,(unsigned long long)m.scheduler_stats.misses,
+            (unsigned long long)m.scheduler_stats.admissions,(unsigned long long)m.scheduler_stats.evictions,
+            (unsigned long long)m.scheduler_stats.speculative_loads,(unsigned long long)m.scheduler_stats.speculative_drops);}
+    granite_usage_save(&m);scratch_free(&s);model_free(&m);free(ids);
 #ifdef COLI_CUDA
     if(cuda_started)coli_cuda_shutdown();
 #endif
     return 0;
 fail:
-    scratch_free(&s);model_free(&m);free(ids);
+    granite_usage_save(&m);scratch_free(&s);model_free(&m);free(ids);
 #ifdef COLI_CUDA
     if(cuda_started)coli_cuda_shutdown();
 #endif

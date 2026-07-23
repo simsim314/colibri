@@ -62,6 +62,10 @@ void coli_tensor_destroy(ColiTensor *tensor);
  * weights. Row views become zero-copy device views of the resident parent. */
 int coli_tensor_reside(const ColiExec *exec, ColiTensor *tensor);
 int coli_tensor_is_resident(const ColiExec *exec, const ColiTensor *tensor);
+/* Release only the selected backend copy; mmap/host storage remains valid. */
+void coli_tensor_release_backend(const ColiExec *exec, ColiTensor *tensor);
+/* Hint the OS page cache for an mmap-backed encoded tensor. */
+void coli_tensor_prefetch_host(const ColiTensor *tensor);
 const void *coli_tensor_device_data(const ColiTensor *tensor);
 
 /* Decode one logical row into caller-provided F32 storage. No decoded tensor is
