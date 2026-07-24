@@ -93,6 +93,7 @@ typedef int (*fn_pipe_gqa_decode)(int device,float *out_dev,const float *q_dev,c
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
+typedef int (*fn_pipe_copy)(int device,void *dst,const void *src,size_t bytes);
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
@@ -109,6 +110,8 @@ typedef int (*fn_pipe_rope_neox)(int device,float *v_dev,int position,int n_head
 typedef int (*fn_pipe_sigmoid_mul)(int device,float *x_dev,const float *gate_dev,size_t n);
 typedef int (*fn_pipe_sigmoid_scale)(int device,float *x_dev,const float *logit_dev,size_t n);
 typedef int (*fn_pipe_gated_delta_decode)(int device,float *out_dev,const float *qkv_dev,const float *z_dev,const float *ba_dev,const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps);
+typedef int (*fn_pipe_gated_delta_decode_separate)(int device,float *out_dev,const float *qkv_dev,const float *z_dev,const float *beta_dev,const float *alpha_dev,const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps);
+typedef int (*fn_pipe_qwen_topk)(int device,const float *logits_dev,int E,int Ksel,int *idx_host,float *w_host);
 typedef int (*fn_pipe_rows_add)(int device,float *x_dev,const float *partial_dev, const int *rows_dev,int nrows,int D);
 typedef float * (*fn_pipe_scratch)(int device,int slot,size_t bytes);
 typedef int (*fn_pipe_silu_mul)(int device,float *gate_dev,const float *up_dev,size_t n);
@@ -162,6 +165,7 @@ static struct {
     fn_pipe_alloc pipe_alloc;
     fn_pipe_copy2d pipe_copy2d;
     fn_pipe_download pipe_download;
+    fn_pipe_copy pipe_copy;
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
     fn_pipe_peer_copy pipe_peer_copy;
@@ -178,6 +182,8 @@ static struct {
     fn_pipe_sigmoid_mul pipe_sigmoid_mul;
     fn_pipe_sigmoid_scale pipe_sigmoid_scale;
     fn_pipe_gated_delta_decode pipe_gated_delta_decode;
+    fn_pipe_gated_delta_decode_separate pipe_gated_delta_decode_separate;
+    fn_pipe_qwen_topk pipe_qwen_topk;
     fn_pipe_rows_add pipe_rows_add;
     fn_pipe_scratch pipe_scratch;
     fn_pipe_silu_mul pipe_silu_mul;
@@ -278,6 +284,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_alloc, fn_pipe_alloc)
     RESOLVE(pipe_copy2d, fn_pipe_copy2d)
     RESOLVE(pipe_download, fn_pipe_download)
+    RESOLVE(pipe_copy, fn_pipe_copy)
     RESOLVE(pipe_free, fn_pipe_free)
     RESOLVE(pipe_gemm, fn_pipe_gemm)
     RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
@@ -294,6 +301,8 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_sigmoid_mul, fn_pipe_sigmoid_mul)
     RESOLVE(pipe_sigmoid_scale, fn_pipe_sigmoid_scale)
     RESOLVE(pipe_gated_delta_decode, fn_pipe_gated_delta_decode)
+    RESOLVE(pipe_gated_delta_decode_separate, fn_pipe_gated_delta_decode_separate)
+    RESOLVE(pipe_qwen_topk, fn_pipe_qwen_topk)
     RESOLVE(pipe_rows_add, fn_pipe_rows_add)
     RESOLVE(pipe_scratch, fn_pipe_scratch)
     RESOLVE(pipe_silu_mul, fn_pipe_silu_mul)
@@ -518,6 +527,10 @@ int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_download(device, src, dst, bytes);
 }
+int coli_cuda_pipe_copy(int device,void *dst,const void *src,size_t bytes){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.pipe_copy(device, dst, src, bytes);
+}
 
 void coli_cuda_pipe_free(int device,void *p){
     if(!g_cuda.available){ return; }
@@ -585,6 +598,12 @@ int coli_cuda_pipe_sigmoid_scale(int device,float *x_dev,const float *logit_dev,
 }
 int coli_cuda_pipe_gated_delta_decode(int device,float *out_dev,const float *qkv_dev,const float *z_dev,const float *ba_dev,const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps){
     if(!g_cuda.available)return 0;return g_cuda.pipe_gated_delta_decode(device,out_dev,qkv_dev,z_dev,ba_dev,conv_weight_dev,dt_bias_dev,a_dev,norm_weight_dev,conv_state_dev,recurrent_state_dev,n_key_heads,n_value_heads,head_dim,conv_kernel,eps);
+}
+int coli_cuda_pipe_gated_delta_decode_separate(int device,float *out_dev,const float *qkv_dev,const float *z_dev,const float *beta_dev,const float *alpha_dev,const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_gated_delta_decode_separate(device,out_dev,qkv_dev,z_dev,beta_dev,alpha_dev,conv_weight_dev,dt_bias_dev,a_dev,norm_weight_dev,conv_state_dev,recurrent_state_dev,n_key_heads,n_value_heads,head_dim,conv_kernel,eps);
+}
+int coli_cuda_pipe_qwen_topk(int device,const float *logits_dev,int E,int Ksel,int *idx_host,float *w_host){
+    if(!g_cuda.available)return 0;return g_cuda.pipe_qwen_topk(device,logits_dev,E,Ksel,idx_host,w_host);
 }
 
 

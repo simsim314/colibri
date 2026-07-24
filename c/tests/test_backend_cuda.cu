@@ -70,13 +70,17 @@ int main(int argc, char **argv) {
      * dequantized inside the CUDA kernel. Each fixture decodes to 256 ones. */
     {
         float qx[256],qy[1]; for(int i=0;i<256;i++) qx[i]=1.f;
-        uint8_t q4k[144]={0},q5k[176]={0},q6k[210]={0};
+        uint8_t q8[34]={0},q4k[144]={0},q5k[176]={0},q6k[210]={0};
         auto put16=[](uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);};
         auto scales=[](uint8_t*p){for(int i=0;i<4;i++)p[i]=1;for(int i=8;i<12;i++)p[i]=1;};
+        put16(q8,0x3c00);std::memset(q8+2,1,32);
         put16(q4k,0x3c00);scales(q4k+4);std::memset(q4k+16,0x11,128);
         put16(q5k,0x3c00);scales(q5k+4);std::memset(q5k+48,0x11,128);
         std::memset(q6k,0x11,128);std::memset(q6k+128,0xaa,64);
         std::memset(q6k+192,1,16);put16(q6k+208,0x3c00);
+        float qx8[32];for(int i=0;i<32;i++)qx8[i]=1.f;
+        if(!coli_cuda_ggml_matmul(qy,qx8,q8,8,sizeof(q8),1,32,1,d0)||
+           std::fabs(qy[0]-32.f)>1e-4f)return 1;
         if(!coli_cuda_ggml_matmul(qy,qx,q4k,12,sizeof(q4k),1,256,1,d0)||
            std::fabs(qy[0]-256.f)>1e-3f)return 1;
         if(!coli_cuda_ggml_matmul(qy,qx,q5k,13,sizeof(q5k),1,256,1,d0)||
@@ -84,6 +88,24 @@ int main(int argc, char **argv) {
         if(!coli_cuda_ggml_matmul(qy,qx,q6k,14,sizeof(q6k),1,256,1,d0)||
            std::fabs(qy[0]-256.f)>1e-3f)return 1;
         if(coli_cuda_ggml_matmul(qy,qx,q4k,12,sizeof(q4k)-1,1,256,1,d0))return 1;
+
+        uint8_t bf16[16];
+        for(int i=0;i<8;i++)put16(bf16+2*i,0x3f80);
+        float bx[8]={1,1,1,1,1,1,1,1},by[1]={0};
+        if(!coli_cuda_ggml_matmul(by,bx,bf16,30,sizeof(bf16),1,8,1,d0)||
+           std::fabs(by[0]-8.f)>1e-4f)return 1;
+
+        ColiCudaTensor *rq8=nullptr;
+        float *dx8=(float*)coli_cuda_pipe_alloc(d0,sizeof(qx8));
+        float *dy8=(float*)coli_cuda_pipe_alloc(d0,sizeof(float));
+        float ry8=0.f;
+        if(!dx8||!dy8||!coli_cuda_tensor_upload_ggml(&rq8,q8,8,sizeof(q8),32,1,d0)||
+           !coli_cuda_pipe_upload(d0,dx8,qx8,sizeof(qx8))||
+           !coli_cuda_pipe_gemm(rq8,dy8,dx8,1)||
+           !coli_cuda_pipe_download(d0,dy8,&ry8,sizeof(ry8))||
+           std::fabs(ry8-32.f)>1e-4f)return 1;
+        coli_cuda_pipe_free(d0,dx8);coli_cuda_pipe_free(d0,dy8);
+        coli_cuda_tensor_free(rq8);
     }
 
     /* Native resident tensor + zero-copy row view + device-resident pipeline. */
@@ -181,6 +203,25 @@ int main(int argc, char **argv) {
            !coli_cuda_pipe_download(d0,drs,gstate,sizeof(gstate))||
            !coli_cuda_pipe_download(d0,dcs,gcstate,sizeof(gcstate)))return 1;
         if(!close_enough(gout,want,2)||!close_enough(gstate,hrs,NV*D*D)||!close_enough(gcstate,hcs,CD*K))return 1;
+
+        /* Qwen3.5 uses independent beta and alpha projections instead of the
+         * Qwen3-Next grouped BA vector. Verify identical math when the values
+         * are arranged equivalently. */
+        float beta[1]={0},alpha[1]={0};
+        float *dbeta=(float*)coli_cuda_pipe_alloc(d0,sizeof(beta));
+        float *dalpha=(float*)coli_cuda_pipe_alloc(d0,sizeof(alpha));
+        std::memset(hcs,0,sizeof(hcs));std::memset(hrs,0,sizeof(hrs));
+        qwen_gdn_oracle(want,qkv,z,ba,cw,dt,a,nw,hcs,hrs,NK,NV,D,K,1e-6f);
+        if(!dbeta||!dalpha||!coli_cuda_pipe_upload(d0,dqkv,qkv,sizeof(qkv))||
+           !coli_cuda_pipe_upload(d0,dbeta,beta,sizeof(beta))||
+           !coli_cuda_pipe_upload(d0,dalpha,alpha,sizeof(alpha))||
+           !coli_cuda_pipe_zero(d0,dcs,CD*K)||!coli_cuda_pipe_zero(d0,drs,NV*D*D)||
+           !coli_cuda_pipe_gated_delta_decode_separate(d0,doo,dqkv,dz,dbeta,dalpha,dcw,ddt,da,dnw,dcs,drs,NK,NV,D,K,1e-6f)||
+           !coli_cuda_pipe_download(d0,doo,gout,sizeof(gout))||
+           !coli_cuda_pipe_download(d0,drs,gstate,sizeof(gstate))||
+           !coli_cuda_pipe_download(d0,dcs,gcstate,sizeof(gcstate)))return 1;
+        if(!close_enough(gout,want,2)||!close_enough(gstate,hrs,NV*D*D)||!close_enough(gcstate,hcs,CD*K))return 1;
+        coli_cuda_pipe_free(d0,dbeta);coli_cuda_pipe_free(d0,dalpha);
         coli_cuda_pipe_free(d0,dqkv);coli_cuda_pipe_free(d0,dz);coli_cuda_pipe_free(d0,dba);
         coli_cuda_pipe_free(d0,dcw);coli_cuda_pipe_free(d0,ddt);coli_cuda_pipe_free(d0,da);
         coli_cuda_pipe_free(d0,dnw);coli_cuda_pipe_free(d0,dcs);coli_cuda_pipe_free(d0,drs);coli_cuda_pipe_free(d0,doo);
@@ -346,6 +387,39 @@ int main(int argc, char **argv) {
     unsetenv("COLI_CUDA_TC_INT4");
     unsetenv("COLI_CUDA_TC_MIN_ROWS");
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
+
+    /* Resident grouped execution for native GGUF Q4_K experts. This is the
+       path used by focused Qwen layers; no weight conversion is permitted. */
+    {
+        const int D=256,I=256,C=2; const size_t rb=144,wb=rb*I;
+        uint8_t *enc=(uint8_t*)std::calloc(1,wb); if(!enc)return 1;
+        auto put16=[](uint8_t*p,uint16_t v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);};
+        for(int r=0;r<I;r++){
+            uint8_t *row=enc+(size_t)r*rb;put16(row,0x3c00);
+            for(int i=0;i<4;i++)row[4+i]=1;
+            for(int i=8;i<12;i++)row[4+i]=1;
+            std::memset(row+16,0x11,128);
+        }
+        ColiCudaTensor *ng[C]={},*nu[C]={},*nd[C]={};
+        for(int c=0;c<C;c++)if(!coli_cuda_tensor_upload_ggml(&ng[c],enc,12,wb,D,I,d0)||
+            !coli_cuda_tensor_upload_ggml(&nu[c],enc,12,wb,D,I,d0)||
+            !coli_cuda_tensor_upload_ggml(&nd[c],enc,12,wb,I,D,d0))return 1;
+        float hx[D];for(int i=0;i<D;i++)hx[i]=1.f;
+        float *dx=(float*)coli_cuda_pipe_alloc(d0,sizeof(hx));
+        float *slots=(float*)coli_cuda_pipe_alloc(d0,D*sizeof(float));
+        float *acc=(float*)coli_cuda_pipe_alloc(d0,D*sizeof(float));
+        float ww[C]={.25f,.75f};int devs[1]={d0};
+        if(!dx||!slots||!acc||!coli_cuda_pipe_upload(d0,dx,hx,sizeof(hx))||
+           !coli_cuda_expert_group_resident_issue(ng,nu,nd,ww,C,d0,dx,slots)||
+           !coli_cuda_expert_group_resident_take(d0,devs,1,slots,acc,D))return 1;
+        float out[D];if(!coli_cuda_pipe_download(d0,acc,out,sizeof(out)))return 1;
+        float h=256.f/(1.f+std::exp(-256.f))*256.f,want=256.f*h;
+        for(int i=0;i<D;i++)if(std::fabs(out[i]-want)>1e-4f*(std::fabs(want)+1.f))return 1;
+        coli_cuda_pipe_free(d0,dx);coli_cuda_pipe_free(d0,slots);coli_cuda_pipe_free(d0,acc);
+        for(int c=0;c<C;c++){coli_cuda_tensor_free(ng[c]);coli_cuda_tensor_free(nu[c]);coli_cuda_tensor_free(nd[c]);}
+        std::free(enc);
+    }
+
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
     if(group_calls!=3||group_experts!=6||group_total_rows!=6) return 1;

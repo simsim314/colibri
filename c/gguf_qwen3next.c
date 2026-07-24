@@ -94,6 +94,10 @@ typedef struct {
     uint32_t expert_access_clock;
     ColiExpertSchedulerStats scheduler_stats;
     int scheduler_evict_guard;
+    int focus_layer_count, focus_layer_effective;
+    unsigned char *focus_layer_mask;
+    int focus_group_enabled, focus_group_min;
+    uint64_t focus_group_calls, focus_group_experts, focus_group_failures;
     int repin_interval, tokens_since_repin;
     int pilot, pilot_real, pilot_real_downgraded, pilot_k;
     int couple, couple_k, couple_d;
@@ -135,7 +139,7 @@ typedef struct {
     float *dx, *dnorm, *dmixer, *dpost;
     float *dqg, *dattn_q, *dattn_gate, *dk, *dv, *dattn, *dscores;
     float *dqkv, *dz, *dba, *ddelta;
-    float *drouter, *dgate, *dup, *dexpert_out, *dmoe;
+    float *drouter, *dgate, *dup, *dexpert_out, *dgroup_out, *dmoe;
     float *dshared_gate, *dshared_up, *dshared_out;
     float *dlogits;
     int cuda_device, cuda_allocated;
@@ -255,6 +259,7 @@ static void qwen_model_free(QwenModel *m) {
     if (m->recurrent_state_dev) coli_cuda_pipe_free(m->exec.device, m->recurrent_state_dev);
 #endif
     free(m->k_cache); free(m->v_cache); free(m->conv_state); free(m->recurrent_state);
+    free(m->focus_layer_mask);
     free(m->architecture);
     coli_expert_coupling_destroy(&m->coupling);
     coli_gguf_tokenizer_destroy(m->tokenizer);
@@ -740,6 +745,17 @@ static int qwen_usage_top(QwenModel *m, int *ids, int cap) {
     return n;
 }
 
+static int qwen_usage_focus(QwenModel *m, int focus_layers, int *ids, int cap,
+                            int *selected, int selected_cap, int *counts) {
+    uint32_t **rows = (uint32_t **)malloc((size_t)m->n_layers * sizeof(*rows));
+    if (!rows) return 0;
+    qwen_usage_rows(m, rows);
+    const int n = coli_expert_usage_focus(rows, m->n_layers, m->n_experts,
+            focus_layers, ids, cap, selected, selected_cap, counts);
+    free(rows);
+    return n;
+}
+
 static int qwen_stats_fallback(QwenModel *m, char *path, size_t cap) {
     if (!m->usage_path[0] || !path || cap == 0) return 0;
     const char *slash = strrchr(m->usage_path, '/');
@@ -756,6 +772,21 @@ static int qwen_stats_fallback(QwenModel *m, char *path, size_t cap) {
 
 static int qwen_scheduler_init(QwenModel *m, char *err, size_t cap) {
     m->scheduler_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
+    m->focus_layer_count = getenv("QWEN_FOCUS_LAYER_COUNT") ?
+                           atoi(getenv("QWEN_FOCUS_LAYER_COUNT")) : 0;
+    if (m->focus_layer_count < 0) m->focus_layer_count = 0;
+    if (m->focus_layer_count > m->n_layers) m->focus_layer_count = m->n_layers;
+    m->focus_group_enabled = m->focus_layer_count > 0;
+    if (getenv("QWEN_FOCUS_GROUP"))
+        m->focus_group_enabled = atoi(getenv("QWEN_FOCUS_GROUP")) != 0;
+    m->focus_group_min = getenv("QWEN_FOCUS_GROUP_MIN") ?
+                         atoi(getenv("QWEN_FOCUS_GROUP_MIN")) : 2;
+    if (m->focus_group_min < 2) m->focus_group_min = 2;
+    if (m->focus_group_min > m->n_expert_used) m->focus_group_min = m->n_expert_used;
+    if (m->focus_layer_count > 0) {
+        m->focus_layer_mask = (unsigned char *)calloc((size_t)m->n_layers, 1);
+        if (!m->focus_layer_mask) return qwen_errf(err, cap, "Qwen focus mask OOM");
+    }
     {
         const char *v = getenv("QWEN_ROUTER_GPU");
         m->cuda_router_gpu_enabled = !v || atoi(v) != 0;
@@ -844,9 +875,43 @@ static int qwen_scheduler_init(QwenModel *m, char *err, size_t cap) {
         if (want > 0 && source) {
             pinids = (int *)malloc((size_t)want * sizeof(int));
             if (!pinids) return qwen_errf(err, cap, "Qwen scheduler pin ranking OOM");
-            npinids = source == m->usage_path ? qwen_usage_top(m, pinids, want) :
-                       coli_expert_usage_top_file(source, m->n_layers, m->n_experts,
-                                                  pinids, want, NULL);
+            if (m->focus_layer_count > 0) {
+                int *selected = (int *)malloc((size_t)m->focus_layer_count * sizeof(*selected));
+                int *counts = (int *)calloc((size_t)m->n_layers, sizeof(*counts));
+                if (!selected || !counts) {
+                    free(selected); free(counts); free(pinids);
+                    return qwen_errf(err, cap, "Qwen focused pin ranking OOM");
+                }
+                for (int i = 0; i < m->focus_layer_count; ++i) selected[i] = -1;
+                npinids = source == m->usage_path ?
+                    qwen_usage_focus(m, m->focus_layer_count, pinids, want,
+                                     selected, m->focus_layer_count, counts) :
+                    coli_expert_usage_focus_file(source, m->n_layers, m->n_experts,
+                                                  m->focus_layer_count, pinids, want,
+                                                  selected, m->focus_layer_count, counts, NULL);
+                m->focus_layer_effective = 0;
+                for (int l = 0; l < m->n_layers; ++l)
+                    if (counts[l] > 0) ++m->focus_layer_effective;
+                if (m->verbose) {
+                    fprintf(stderr, "[FOCUS] Qwen hot pins: requested=%d effective=%d budget=%d layers=",
+                            m->focus_layer_count, m->focus_layer_effective, want);
+                    int shown = 0;
+                    for (int i = 0; i < m->focus_layer_count && selected[i] >= 0; ++i) {
+                        const int l = selected[i];
+                        if (m->focus_layer_mask) m->focus_layer_mask[l] = 1;
+                        fprintf(stderr, "%s%d:%d", shown++ ? "," : "", l, counts[l]);
+                    }
+                    fputc('\n', stderr);
+                } else if (m->focus_layer_mask) {
+                    for (int i = 0; i < m->focus_layer_count && selected[i] >= 0; ++i)
+                        m->focus_layer_mask[selected[i]] = 1;
+                }
+                free(selected); free(counts);
+            } else {
+                npinids = source == m->usage_path ? qwen_usage_top(m, pinids, want) :
+                           coli_expert_usage_top_file(source, m->n_layers, m->n_experts,
+                                                      pinids, want, NULL);
+            }
             pin_total = npinids;
             if (m->verbose) fprintf(stderr, "[PIN] Qwen GGUF: %d experts from %s\n", npinids, source);
         }
@@ -916,8 +981,10 @@ static int qwen_scheduler_init(QwenModel *m, char *err, size_t cap) {
     free(pc); free(pinids);
 
     if (m->verbose)
-        fprintf(stderr, "[SCHED] one native scheduler: Qwen %d pin + %d LRU slots, %.2f MiB/slot; PILOT=%s COUPLE=%s\n",
+        fprintf(stderr, "[SCHED] one native scheduler: Qwen %d pin + %d LRU slots, %.2f MiB/slot; FOCUS=%s GROUP=%s/%d PILOT=%s COUPLE=%s\n",
                 pin_total, cache_slots, m->expert_bytes / (1024.0 * 1024.0),
+                m->focus_layer_count > 0 ? "on" : "off",
+                m->focus_group_enabled ? "on" : "off", m->focus_group_min,
                 m->pilot ? (m->pilot_real ? "real" : "hint") : "off",
                 m->couple ? "on" : "off");
     return 1;
@@ -1070,7 +1137,7 @@ static void qwen_scratch_free(QwenScratch *s) {
         QDFREE(dx); QDFREE(dnorm); QDFREE(dmixer); QDFREE(dpost);
         QDFREE(dqg); QDFREE(dattn_q); QDFREE(dattn_gate); QDFREE(dk); QDFREE(dv); QDFREE(dattn); QDFREE(dscores);
         QDFREE(dqkv); QDFREE(dz); QDFREE(dba); QDFREE(ddelta);
-        QDFREE(drouter); QDFREE(dgate); QDFREE(dup); QDFREE(dexpert_out); QDFREE(dmoe);
+        QDFREE(drouter); QDFREE(dgate); QDFREE(dup); QDFREE(dexpert_out); QDFREE(dgroup_out); QDFREE(dmoe);
         QDFREE(dshared_gate); QDFREE(dshared_up); QDFREE(dshared_out); QDFREE(dlogits);
 #undef QDFREE
     }
@@ -1128,7 +1195,7 @@ static int qwen_scratch_alloc(const QwenModel *m, QwenScratch *s, char *err, siz
         QDALLOC(ddelta, m->value_dim); QDALLOC(drouter, m->n_experts);
         QDALLOC(dgate, m->expert_ff > m->shared_ff ? m->expert_ff : m->shared_ff);
         QDALLOC(dup, m->expert_ff > m->shared_ff ? m->expert_ff : m->shared_ff);
-        QDALLOC(dexpert_out, m->hidden); QDALLOC(dmoe, m->hidden);
+        QDALLOC(dexpert_out, m->hidden); QDALLOC(dgroup_out, m->hidden); QDALLOC(dmoe, m->hidden);
         QDALLOC(dshared_gate, 1); QDALLOC(dshared_up, m->shared_ff); QDALLOC(dshared_out, m->hidden);
         QDALLOC(dlogits, m->vocab);
 #undef QDALLOC
@@ -1275,6 +1342,52 @@ static int qwen_expert_device(QwenModel *m, QwenScratch *s,
            coli_cuda_pipe_axpy(dev, s->dmoe, s->dexpert_out, weight, (size_t)m->hidden);
 }
 
+/* Record a routed demand only when it is already resident. Misses are left
+ * untouched here and pass through qwen_expert_acquire() later, which records
+ * the demand exactly once while preserving the normal admission policy. */
+static QwenExpertSlot *qwen_expert_lookup_demand_hit(QwenModel *m, int layer,
+                                                      int eid, int *from_pin) {
+    ColiExpertLayerStore st = qwen_store(m, layer);
+    ColiExpertLookup h = coli_expert_lookup(&st, eid, 0);
+    if (!h.slot) return NULL;
+    if (from_pin) *from_pin = h.from_pin;
+    coli_expert_record_demand(&st, eid);
+    ++m->scheduler_stats.hits;
+    if (h.from_pin) ++m->scheduler_stats.pin_hits;
+    else {
+        ++m->scheduler_stats.cache_hits;
+        coli_expert_slot_touch(h.slot, &st.layout, st.clock);
+    }
+    return (QwenExpertSlot *)h.slot;
+}
+
+/* Group only focused pinned experts. Pin storage cannot be evicted by the
+ * sequential miss admissions that follow, so the group never holds an LRU
+ * pointer across a policy transition. */
+static int qwen_expert_group_device(QwenModel *m, QwenScratch *s,
+                                    QwenExpertSlot *const *slots,
+                                    const float *weights, int count) {
+    if (count < m->focus_group_min || count > 64) return 0;
+    ColiCudaTensor *g[64], *u[64], *d[64];
+    for (int i = 0; i < count; ++i) {
+        QwenExpertSlot *q = slots[i];
+        if (!q || !q->gate || !q->up || !q->down ||
+            !q->gate->cuda || !q->up->cuda || !q->down->cuda) return 0;
+        g[i] = q->gate->cuda; u[i] = q->up->cuda; d[i] = q->down->cuda;
+    }
+    const int dev = m->exec.device, devices[1] = { dev };
+    if (!coli_cuda_expert_group_resident_issue(g, u, d, weights, count,
+                                                dev, s->dpost, s->dexpert_out) ||
+        !coli_cuda_expert_group_resident_take(dev, devices, 1,
+                                               s->dexpert_out, s->dgroup_out,
+                                               m->hidden) ||
+        !coli_cuda_pipe_add(dev, s->dmoe, s->dgroup_out, (size_t)m->hidden))
+        return 0;
+    ++m->focus_group_calls;
+    m->focus_group_experts += (uint64_t)count;
+    return 1;
+}
+
 static int qwen_expert_cpu_accumulate(QwenModel *m, QwenScratch *s,
                                       QwenLayer *L, int eid, float weight,
                                       int *post_ready, int *moe_ready,
@@ -1408,9 +1521,43 @@ static int qwen_forward_cuda(QwenModel *m, QwenScratch *s, int token, int pos,
 
         int post_host_ready = 0;
         int host_moe_ready = 0;
+        unsigned char handled[64] = {0};
+        QwenExpertSlot *resident[64] = {0};
+
+        /* The focused tier is the only place where concentration can produce a
+         * multi-expert launch. Look up hits without admitting misses, group the
+         * pinned resident set, collect it, and only then resume the stable one-at-a-time
+         * admission path. Non-focused layers remain byte-for-byte policy-compatible. */
+        if (m->focus_group_enabled && m->focus_layer_mask && m->focus_layer_mask[l]) {
+            QwenExpertSlot *group_slots[64];
+            float group_weights[64];
+            int group_index[64], gn = 0;
+            for (int j = 0; j < nk; ++j) {
+                int from_pin = 0;
+                resident[j] = qwen_expert_lookup_demand_hit(m, l, s->top_idx[j], &from_pin);
+                if (resident[j] && from_pin) {
+                    group_slots[gn] = resident[j];
+                    group_weights[gn] = s->top_w[j];
+                    group_index[gn++] = j;
+                }
+            }
+            if (gn >= m->focus_group_min) {
+                if (qwen_expert_group_device(m, s, group_slots, group_weights, gn)) {
+                    for (int q = 0; q < gn; ++q) handled[group_index[q]] = 1;
+                } else {
+                    ++m->focus_group_failures;
+                    m->focus_group_enabled = 0;
+                    if (m->verbose)
+                        fprintf(stderr,
+                            "[FOCUS] Qwen resident group failed; disabling grouping and retaining sequential execution\n");
+                }
+            }
+        }
+
         for (int j = 0; j < nk; ++j) {
+            if (handled[j]) continue;
             const int e = s->top_idx[j];
-            QwenExpertSlot *slot = qwen_expert_acquire(m, l, e, 1);
+            QwenExpertSlot *slot = resident[j] ? resident[j] : qwen_expert_acquire(m, l, e, 1);
             if (slot && qwen_expert_device(m, s, slot, s->top_w[j])) continue;
             if (slot && !m->cuda_expert_compute_disabled) {
                 m->cuda_expert_compute_disabled = 1;
@@ -1619,7 +1766,7 @@ int coli_qwen3next_run_cli(int argc, char **argv) {
 #ifdef COLI_CUDA
         if (m.exec.kind == COLI_BACKEND_CUDA)
             fprintf(stderr,
-                "[QWEN] router=%s router_gpu=%llu router_cpu_fallback=%llu expert_cpu_fallback=%llu residency_fail=%llu compute_fail=%llu admissions=%s pilot=%s%s\n",
+                "[QWEN] router=%s router_gpu=%llu router_cpu_fallback=%llu expert_cpu_fallback=%llu residency_fail=%llu compute_fail=%llu admissions=%s pilot=%s%s group_calls=%llu group_experts=%llu group_fail=%llu\n",
                 m.cuda_router_gpu_enabled ? "gpu" : "cpu",
                 (unsigned long long)m.cuda_router_gpu_calls,
                 (unsigned long long)m.cuda_router_cpu_fallbacks,
@@ -1628,7 +1775,10 @@ int coli_qwen3next_run_cli(int argc, char **argv) {
                 (unsigned long long)m.cuda_expert_compute_failures,
                 m.cuda_expert_admission_disabled ? "disabled" : "enabled",
                 m.pilot ? (m.pilot_real ? "real" : "hint") : "off",
-                m.pilot_real_downgraded ? " (auto-downgraded)" : "");
+                m.pilot_real_downgraded ? " (auto-downgraded)" : "",
+                (unsigned long long)m.focus_group_calls,
+                (unsigned long long)m.focus_group_experts,
+                (unsigned long long)m.focus_group_failures);
 #endif
     }
     qwen_usage_save(&m); qwen_scratch_free(&s); qwen_model_free(&m); free(ids);

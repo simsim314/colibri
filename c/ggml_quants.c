@@ -18,6 +18,13 @@ static float load_f32(const uint8_t *p) {
     return f;
 }
 
+float coli_bf16_to_fp32(uint16_t h) {
+    uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
 float coli_fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
     uint32_t exp = (h >> 10) & 0x1fu;
@@ -219,6 +226,9 @@ int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
             case 13: deq_q5_k(p, y); break;
             case 14: deq_q6_k(p, y); break;
             case 15: deq_q8_k(p, y); break;
+            case 30:
+                y[0] = coli_bf16_to_fp32(load_u16(p));
+                break;
             default: return 0;
         }
         p += t->block_bytes;

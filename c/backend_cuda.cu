@@ -49,6 +49,7 @@ typedef struct {
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
     cudaStream_t stream;
+    cudaEvent_t ev_input; int ev_input_ok;      /* default-stream input ready for nonblocking group stream */
     cudaEvent_t ev_done; int ev_done_ok;        /* resident-group issue completion (#431 PR-C0) */
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -59,6 +60,9 @@ typedef struct {
     const void *g,*u,*d; const float *gs,*us,*ds;
     int gf,uf,df,rows,offset;
     int ggs,ugs,dgs;      /* per-tensor quant group size; 0 = per-row scales (#334 fmt=4) */
+    uint32_t gt,ut,dt;    /* GGML dtype for native grouped tensors */
+    size_t grb,urb,drb;   /* native encoded row sizes */
+    int native_ggml;
 } GroupDesc;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -171,7 +175,8 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
 __host__ __device__ static size_t ggml_row_bytes(uint32_t type, int I) {
     if (I < 1) return 0;
     if (type == 0) return (size_t)I * 4;
-    if (type == 1) return (size_t)I * 2;
+    if (type == 1 || type == 30) return (size_t)I * 2;
+    if (type == 8 && (I % 32) == 0) return (size_t)(I / 32) * 34;
     if ((type == 12 || type == 13 || type == 14) && (I % 256) == 0) {
         size_t bs = type == 12 ? 144 : (type == 13 ? 176 : 210);
         return (size_t)(I / 256) * bs;
@@ -187,6 +192,9 @@ __device__ static uint32_t ggml_u32(const uint8_t *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 __device__ static float ggml_f32(const uint8_t *p) { return __uint_as_float(ggml_u32(p)); }
+__device__ static float ggml_bf16(const uint8_t *p) {
+    return __uint_as_float((uint32_t)ggml_u16(p) << 16);
+}
 __device__ static float ggml_f16(const uint8_t *p) {
     uint16_t h=ggml_u16(p); uint32_t sign=(uint32_t)(h&0x8000u)<<16;
     uint32_t e=(h>>10)&31u,m=h&1023u,out;
@@ -205,6 +213,11 @@ __device__ static void ggml_scale_min(int j,const uint8_t *q,int *sc,int *mn){
 __device__ static float ggml_weight(const uint8_t *row,uint32_t type,int i){
     if(type==0) return ggml_f32(row+(size_t)i*4);
     if(type==1) return ggml_f16(row+(size_t)i*2);
+    if(type==30) return ggml_bf16(row+(size_t)i*2);
+    if(type==8){
+        const uint8_t *p=row+(size_t)(i>>5)*34;
+        return ggml_f16(p)*(float)(int8_t)p[2+(i&31)];
+    }
     int bi=i>>8,j=i&255;
     if(type==12){
         const uint8_t *p=row+(size_t)bi*144; float d=ggml_f16(p),dm=ggml_f16(p+2);
@@ -415,6 +428,32 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
     __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0]*d.ds[o];
+}
+
+/* Native GGUF grouped decode path. Each block handles one output row of one
+ * resident expert; blockIdx.z selects the expert. Gate and up share one input
+ * traversal and one pair of reductions, so Q4_K/Q5_K/Q6_K experts receive the
+ * same grouped launch shape as the mature per-row W4 path. */
+__global__ static void grouped_hidden_ggml_dual(float *gate,float *up,const float *x,
+                                                const GroupDesc *desc,int I,int D){
+    int o=blockIdx.x,c=blockIdx.z;GroupDesc d=desc[c];
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*d.grb;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*d.urb;
+    const float *xs=x+(size_t)c*D;float ga=0.f,ua=0.f;
+    for(int i=threadIdx.x;i<D;i+=blockDim.x){float xv=xs[i];ga+=xv*ggml_weight(gr,d.gt,i);ua+=xv*ggml_weight(ur,d.ut,i);}
+    __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
+    if(!threadIdx.x){gate[(size_t)c*I+o]=gp[0];up[(size_t)c*I+o]=upv[0];}
+}
+
+__global__ static void grouped_down_ggml(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    int o=blockIdx.x,c=blockIdx.z;GroupDesc d=desc[c];
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*d.drb;
+    const float *xs=x+(size_t)c*I;float sum=0.f;
+    for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=xs[i]*ggml_weight(row,d.dt,i);
+    __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)c*D+o]=p[0];
 }
 
 /* fmt=4 grouped-int4 variants (#334): identical structure to the w4 kernels,
@@ -632,6 +671,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
+        if (ctx->ev_input_ok) cudaEventDestroy(ctx->ev_input);
+        if (ctx->ev_done_ok) cudaEventDestroy(ctx->ev_done);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
@@ -1470,6 +1511,43 @@ __global__ static void qwen_gated_delta_kernel(float *out,const float *conv,
     if(tid<D){float g=z[(size_t)vh*D+tid];float silu=g/(1.f+expf(-g));out[(size_t)vh*D+tid]=core[tid]*inv*norm[tid]*silu;}
 }
 
+
+__global__ static void q35_gated_delta_kernel(float *out,const float *conv,
+        const float *z,const float *beta_raw,const float *alpha_raw,
+        const float *dt,const float *a,const float *norm,
+        float *state,int nk,int nv,int D,float eps){
+    /* Q35/Q36 GGUF stores V-related heads in tiled K-head order. */
+    int vh=blockIdx.x,tid=threadIdx.x,kh=vh%nk;
+    extern __shared__ float sh[];float *q=sh,*k=q+D,*core=k+D,*red=core+D;
+    const float *qsrc=conv+(size_t)kh*D;
+    const float *ksrc=conv+(size_t)nk*D+(size_t)kh*D;
+    const float *vsrc=conv+(size_t)2*nk*D+(size_t)vh*D;
+    if(tid<D){q[tid]=qsrc[tid];k[tid]=ksrc[tid];red[tid]=q[tid]*q[tid];}
+    else if(tid<256)red[tid]=0.f;
+    __syncthreads();
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)red[tid]+=red[tid+stride];__syncthreads();}
+    float iq=rsqrtf(red[0]+1e-6f);
+    if(tid<D){q[tid]*=iq;red[tid]=k[tid]*k[tid];}else if(tid<256)red[tid]=0.f;
+    __syncthreads();
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)red[tid]+=red[tid+stride];__syncthreads();}
+    float ik=rsqrtf(red[0]+1e-6f);if(tid<D)k[tid]*=ik;__syncthreads();
+
+    float br=beta_raw[vh], ar=alpha_raw[vh];
+    float beta=br>=0.f?1.f/(1.f+expf(-br)):expf(br)/(1.f+expf(br));
+    float decay=expf(a[vh]*qwen_softplus_device(ar+dt[vh]));
+    if(tid<D){
+        int col=tid;float *Sc=state+((size_t)vh*D+col)*D;float kv=0.f;
+        for(int i=0;i<D;i++)kv+=Sc[i]*k[i];
+        float delta=(vsrc[col]-decay*kv)*beta,y=0.f;
+        for(int i=0;i<D;i++){float sv=decay*Sc[i]+k[i]*delta;Sc[i]=sv;y+=sv*q[i];}
+        core[col]=y*rsqrtf((float)D);red[col]=core[col]*core[col];
+    }else if(tid<256)red[tid]=0.f;
+    __syncthreads();
+    for(int stride=128;stride>0;stride>>=1){if(tid<stride)red[tid]+=red[tid+stride];__syncthreads();}
+    float inv=rsqrtf(red[0]/D+eps);
+    if(tid<D){float g=z[(size_t)vh*D+tid];float silu=g/(1.f+expf(-g));out[(size_t)vh*D+tid]=core[tid]*inv*norm[tid]*silu;}
+}
+
 __global__ static void pipe_add_n(float *x,const float *t,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
     if(i<n) x[i]+=t[i];
@@ -1559,6 +1637,10 @@ extern "C" int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t
 extern "C" int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToHost),"pipe download");
+}
+extern "C" int coli_cuda_pipe_copy(int device,void *dst,const void *src,size_t bytes){
+    DeviceContext *ctx=find_ctx(device); if(!dst||!src||!bytes||!select_ctx(ctx)) return 0;
+    return cuda_ok(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyDeviceToDevice,0),"pipe device copy");
 }
 extern "C" int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                                       const float *w_dev,int S,int D,float eps){
@@ -1650,6 +1732,26 @@ extern "C" int coli_cuda_pipe_gated_delta_decode(int device,float *out_dev,
     qwen_gated_delta_kernel<<<n_value_heads,256,shared>>>(out_dev,conv,z_dev,ba_dev,dt_bias_dev,a_dev,
         norm_weight_dev,recurrent_state_dev,n_key_heads,n_value_heads,head_dim,eps);
     return cuda_ok(cudaGetLastError(),"qwen gated delta decode");
+}
+
+extern "C" int coli_cuda_pipe_gated_delta_decode_separate(int device,float *out_dev,
+        const float *qkv_dev,const float *z_dev,const float *beta_dev,const float *alpha_dev,
+        const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,
+        const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,
+        int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps){
+    if(fault_injected())return 0;DeviceContext *ctx=find_ctx(device);
+    if(!out_dev||!qkv_dev||!z_dev||!beta_dev||!alpha_dev||!conv_weight_dev||!dt_bias_dev||!a_dev||
+       !norm_weight_dev||!conv_state_dev||!recurrent_state_dev||n_key_heads<1||
+       n_value_heads<n_key_heads||n_value_heads%n_key_heads||head_dim<1||head_dim>256||
+       conv_kernel<1||conv_kernel>16||!select_ctx(ctx))return 0;
+    int conv_dim=(2*n_key_heads+n_value_heads)*head_dim;
+    float *conv=coli_cuda_pipe_scratch(device,25,(size_t)conv_dim*sizeof(float));if(!conv)return 0;
+    qwen_conv_update_kernel<<<(conv_dim+255)/256,256>>>(qkv_dev,conv,conv_weight_dev,conv_state_dev,conv_dim,conv_kernel);
+    if(!cuda_ok(cudaGetLastError(),"q35 causal conv"))return 0;
+    size_t shared=((size_t)3*head_dim+256)*sizeof(float);
+    q35_gated_delta_kernel<<<n_value_heads,256,shared>>>(out_dev,conv,z_dev,beta_dev,alpha_dev,
+        dt_bias_dev,a_dev,norm_weight_dev,recurrent_state_dev,n_key_heads,n_value_heads,head_dim,eps);
+    return cuda_ok(cudaGetLastError(),"q35 gated delta decode");
 }
 /* ---- device router (#431 PR-A) -------------------------------------------
  * Router for one decode row, entirely on the layer's home device: logits GEMV
@@ -1815,18 +1917,24 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
     ColiCudaTensor *first=gates[0]; if(!first) return 0;
     int device=first->device,D=first->I,I=first->O;
     GroupDesc host[64];
-    int total=0,all_s4=1;
+    int total=0,all_s4=1,all_native=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
                  g->fmt,u->fmt,d->fmt,1,total,
-                 g->gs,u->gs,d->gs};
-        all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+                 g->gs,u->gs,d->gs,
+                 g->ggml_type,u->ggml_type,d->ggml_type,
+                 g->native_row_bytes,u->native_row_bytes,d->native_row_bytes,
+                 g->native_ggml&&u->native_ggml&&d->native_ggml};
+        all_s4&=!g->native_ggml&&!u->native_ggml&&!d->native_ggml&&
+                g->fmt==2&&u->fmt==2&&d->fmt==2;
+        all_native&=g->native_ggml&&u->native_ggml&&d->native_ggml&&
+                    g->native_row_bytes&&u->native_row_bytes&&d->native_row_bytes;
         total++;
     }
-    if(!all_s4) return 0;                       /* resident path: per-row int4 only */
+    if(!all_s4&&!all_native) return 0;
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     if(!ctx->ev_done_ok){
         if(!cuda_ok(cudaEventCreateWithFlags(&ctx->ev_done,cudaEventDisableTiming),
@@ -1848,21 +1956,40 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
        !cuda_ok(cudaMemcpyAsync(w_dev,weights,(size_t)count*sizeof(float),
                                 cudaMemcpyHostToDevice,ctx->stream),"resident group weights"))
         return 0;
-    /* input row: P2P from the home device. The caller guarantees x_src_dev is
-     * materialized (the pre-moe nrm download already synced the home stream). */
-    if(!cuda_ok(cudaMemcpyPeerAsync(ctx->x,device,x_src_dev,home_device,
-                                    (size_t)D*sizeof(float),ctx->stream),"resident group x p2p"))
-        return 0;
-    bcast_row<<<64,256,0,ctx->stream>>>(ctx->x,ctx->x,count,D);   /* row 0 -> rows 1..count-1 (in-place safe: row 0 rewritten with itself) */
+    /* The group stream is nonblocking, so same-device Qwen input needs an
+     * explicit dependency on the legacy/default stream that produced dpost. */
+    if(device==home_device){
+        if(!ctx->ev_input_ok){
+            if(!cuda_ok(cudaEventCreateWithFlags(&ctx->ev_input,cudaEventDisableTiming),
+                        "resident input event")) return 0;
+            ctx->ev_input_ok=1;
+        }
+        if(!cuda_ok(cudaEventRecord(ctx->ev_input,0),"resident input record")||
+           !cuda_ok(cudaStreamWaitEvent(ctx->stream,ctx->ev_input,0),"resident input wait")) return 0;
+    }
+    /* Same-device Qwen copies must not use cudaMemcpyPeerAsync. Multi-GPU GLM
+     * continues through the P2P branch. */
+    cudaError_t copy_in=device==home_device ?
+        cudaMemcpyAsync(ctx->x,x_src_dev,(size_t)D*sizeof(float),cudaMemcpyDeviceToDevice,ctx->stream) :
+        cudaMemcpyPeerAsync(ctx->x,device,x_src_dev,home_device,(size_t)D*sizeof(float),ctx->stream);
+    if(!cuda_ok(copy_in,"resident group x copy")) return 0;
+    bcast_row<<<64,256,0,ctx->stream>>>(ctx->x,ctx->x,count,D);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     dim3 hg((unsigned)I,1,(unsigned)count),og((unsigned)D,1,(unsigned)count);
-    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-    silu_mul<<<(unsigned)(((size_t)count*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)count*I);
-    grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    if(all_s4){
+        grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        silu_mul<<<(unsigned)(((size_t)count*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)count*I);
+        grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else{
+        grouped_hidden_ggml_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        silu_mul<<<(unsigned)(((size_t)count*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)count*I);
+        grouped_down_ggml<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }
     weighted_sum_rows<<<48,256,0,ctx->stream>>>(partial_local,ctx->y,w_dev,count,D);
-    if(!cuda_ok(cudaMemcpyPeerAsync(partial_slot_dev,home_device,partial_local,device,
-                                    (size_t)D*sizeof(float),ctx->stream),"resident partial p2p"))
-        return 0;
+    cudaError_t copy_out=device==home_device ?
+        cudaMemcpyAsync(partial_slot_dev,partial_local,(size_t)D*sizeof(float),cudaMemcpyDeviceToDevice,ctx->stream) :
+        cudaMemcpyPeerAsync(partial_slot_dev,home_device,partial_local,device,(size_t)D*sizeof(float),ctx->stream);
+    if(!cuda_ok(copy_out,"resident partial copy")) return 0;
     if(!cuda_ok(cudaEventRecord(ctx->ev_done,ctx->stream),"resident event record")) return 0;
     return cuda_ok(cudaGetLastError(),"resident group launch");
 }

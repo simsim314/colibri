@@ -8,8 +8,11 @@ int main(void) {
     assert(q5 && q5->block_values == 256 && q5->block_bytes == 176);
     const ColiGgmlTypeTraits *q81 = coli_ggml_type_traits(9);
     assert(q81 && q81->block_bytes == 36);
+    const ColiGgmlTypeTraits *bf16 = coli_ggml_type_traits(30);
+    assert(bf16 && !bf16->quantized && bf16->block_values == 1 && bf16->block_bytes == 2);
     uint64_t n;
     assert(coli_ggml_row_size(12, 512, &n) && n == 288);
+    assert(coli_ggml_row_size(30, 2048, &n) && n == 4096);
     assert(!coli_ggml_row_size(12, 257, &n));
     uint64_t dims[] = { 1024, 512, 32 };
     uint64_t elems;

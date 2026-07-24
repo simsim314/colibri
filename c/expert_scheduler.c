@@ -331,6 +331,141 @@ int coli_expert_usage_top_file(const char *path, int n_layers, int n_experts,
 }
 
 
+typedef struct {
+    int eid;
+    uint32_t count;
+} ColiUsageExpertRank;
+
+typedef struct {
+    int layer;
+    uint64_t score;
+} ColiUsageLayerRank;
+
+static int usage_expert_cmp(const void *a, const void *b) {
+    const ColiUsageExpertRank *x = (const ColiUsageExpertRank *)a;
+    const ColiUsageExpertRank *y = (const ColiUsageExpertRank *)b;
+    if (x->count != y->count) return x->count < y->count ? 1 : -1;
+    return x->eid > y->eid ? 1 : (x->eid < y->eid ? -1 : 0);
+}
+
+static int usage_layer_cmp(const void *a, const void *b) {
+    const ColiUsageLayerRank *x = (const ColiUsageLayerRank *)a;
+    const ColiUsageLayerRank *y = (const ColiUsageLayerRank *)b;
+    if (x->score != y->score) return x->score < y->score ? 1 : -1;
+    return x->layer > y->layer ? 1 : (x->layer < y->layer ? -1 : 0);
+}
+
+int coli_expert_usage_focus(uint32_t *const *usage, int n_layers, int n_experts,
+                            int focus_layers, int *flat_ids, int output_cap,
+                            int *selected_layers, int selected_cap,
+                            int *per_layer_counts) {
+    if (!usage || !flat_ids || output_cap <= 0 || n_layers <= 0 || n_experts <= 0)
+        return 0;
+    if (focus_layers <= 0)
+        return coli_expert_usage_top(usage, n_layers, n_experts, flat_ids, output_cap);
+    if (focus_layers > output_cap) focus_layers = output_cap;
+    if (focus_layers > n_layers) focus_layers = n_layers;
+    if (selected_cap < 0) selected_cap = 0;
+    if (per_layer_counts) memset(per_layer_counts, 0, (size_t)n_layers * sizeof(*per_layer_counts));
+
+    const int layer_cap = (output_cap + focus_layers - 1) / focus_layers;
+    if ((size_t)n_layers > SIZE_MAX / (size_t)n_experts) return 0;
+    const size_t cells = (size_t)n_layers * (size_t)n_experts;
+    if (cells > SIZE_MAX / sizeof(ColiUsageExpertRank)) return 0;
+    ColiUsageExpertRank *rank = (ColiUsageExpertRank *)malloc(cells * sizeof(*rank));
+    ColiUsageLayerRank *layers = (ColiUsageLayerRank *)calloc((size_t)n_layers, sizeof(*layers));
+    unsigned char *chosen = (unsigned char *)calloc((size_t)n_layers, 1);
+    ColiUsageRank *candidates = (ColiUsageRank *)malloc(cells * sizeof(*candidates));
+    int *counts = per_layer_counts ? per_layer_counts :
+                  (int *)calloc((size_t)n_layers, sizeof(*counts));
+    if (!rank || !layers || !chosen || !candidates || !counts) {
+        free(rank); free(layers); free(chosen); free(candidates);
+        if (!per_layer_counts) free(counts);
+        return 0;
+    }
+
+    for (int l = 0; l < n_layers; ++l) {
+        ColiUsageExpertRank *r = rank + (size_t)l * n_experts;
+        for (int e = 0; e < n_experts; ++e) {
+            r[e].eid = e;
+            r[e].count = usage[l] ? usage[l][e] : 0;
+        }
+        qsort(r, (size_t)n_experts, sizeof(*r), usage_expert_cmp);
+        uint64_t score = 0;
+        const int lim = layer_cap < n_experts ? layer_cap : n_experts;
+        for (int i = 0; i < lim; ++i) score += r[i].count;
+        layers[l] = (ColiUsageLayerRank){l, score};
+    }
+    qsort(layers, (size_t)n_layers, sizeof(*layers), usage_layer_cmp);
+
+    int selected_n = 0;
+    for (int i = 0; i < n_layers && selected_n < focus_layers; ++i) {
+        const int l = layers[i].layer;
+        const ColiUsageExpertRank *r = rank + (size_t)l * n_experts;
+        if (!r[0].count) continue;
+        chosen[l] = 1;
+        if (selected_layers && selected_n < selected_cap) selected_layers[selected_n] = l;
+        ++selected_n;
+    }
+    if (!selected_n) {
+        free(rank); free(layers); free(chosen); free(candidates);
+        if (!per_layer_counts) free(counts);
+        return 0;
+    }
+
+    /* Guarantee one hot expert in each chosen layer so the requested K is a
+     * real policy parameter. Fill the rest globally by observed demand while
+     * enforcing the equal-share ceiling. */
+    int out = 0;
+    for (int i = 0; i < n_layers && out < output_cap; ++i) if (chosen[i]) {
+        ColiUsageExpertRank *r = rank + (size_t)i * n_experts;
+        if (!r[0].count) continue;
+        flat_ids[out++] = i * n_experts + r[0].eid;
+        counts[i] = 1;
+    }
+
+    size_t ncand = 0;
+    for (int l = 0; l < n_layers; ++l) if (chosen[l]) {
+        ColiUsageExpertRank *r = rank + (size_t)l * n_experts;
+        const int lim = layer_cap < n_experts ? layer_cap : n_experts;
+        for (int i = 1; i < lim && r[i].count; ++i)
+            candidates[ncand++] = (ColiUsageRank){l * n_experts + r[i].eid, r[i].count};
+    }
+    qsort(candidates, ncand, sizeof(*candidates), usage_rank_cmp);
+    for (size_t i = 0; i < ncand && out < output_cap; ++i) {
+        const int l = candidates[i].flat_id / n_experts;
+        if (counts[l] >= layer_cap) continue;
+        flat_ids[out++] = candidates[i].flat_id;
+        ++counts[l];
+    }
+
+    free(rank); free(layers); free(chosen); free(candidates);
+    if (!per_layer_counts) free(counts);
+    return out;
+}
+
+int coli_expert_usage_focus_file(const char *path, int n_layers, int n_experts,
+                                 int focus_layers, int *flat_ids, int output_cap,
+                                 int *selected_layers, int selected_cap,
+                                 int *per_layer_counts, int64_t *total) {
+    if (total) *total = 0;
+    if (!path || !flat_ids || output_cap <= 0 || n_layers <= 0 || n_experts <= 0) return 0;
+    if ((size_t)n_layers > SIZE_MAX / (size_t)n_experts) return 0;
+    const size_t cells = (size_t)n_layers * (size_t)n_experts;
+    uint32_t **rows = (uint32_t **)calloc((size_t)n_layers, sizeof(*rows));
+    uint32_t *data = (uint32_t *)calloc(cells, sizeof(*data));
+    if (!rows || !data) { free(rows); free(data); return 0; }
+    for (int l = 0; l < n_layers; ++l) rows[l] = data + (size_t)l * n_experts;
+    const int64_t loaded = coli_expert_usage_load(path, rows, n_layers, n_experts);
+    const int out = loaded > 0 ? coli_expert_usage_focus(rows, n_layers, n_experts,
+            focus_layers, flat_ids, output_cap, selected_layers, selected_cap,
+            per_layer_counts) : 0;
+    if (total) *total = loaded;
+    free(data); free(rows);
+    return out;
+}
+
+
 int coli_expert_coupling_load(ColiExpertCoupling *c, const char *path,
                               int n_layers, int n_experts,
                               long *conditioning_entries) {

@@ -77,6 +77,44 @@ CUDA_RESERVE_GB=3.5 \
 
 When too few LRU slots are available per layer, real GPU prefetch automatically becomes an mmap page-cache hint.
 
+## Focused hot-expert grouping
+
+Concentrate the existing hot-pin budget in an automatically selected number of
+layers and group simultaneous resident hits only inside those focused layers:
+
+```bash
+QWEN_ROUTER_GPU=0 \
+QWEN_FOCUS_LAYER_COUNT=3 \
+QWEN_FOCUS_GROUP=1 \
+QWEN_FOCUS_GROUP_MIN=2 \
+PILOT=0 \
+PILOT_REAL=0 \
+PIN=auto \
+AUTOPIN=1 \
+CUDA_RESERVE_GB=3.5 \
+./colibri \
+  --gguf "$MODEL" \
+  --device cuda \
+  --prompt 'Tell a short story about France.' \
+  --max-tokens 60 \
+  --verbose
+```
+
+Non-focused layers retain the released-compatible one-expert-at-a-time GPU
+streaming path. The grouped kernel receives only experts that were already
+resident; misses are admitted sequentially after the group completes.
+
+Estimate a layer count from the usage history without loading the model:
+
+```bash
+python3 tools/qwen_focus_tool.py recommend \
+  "$MODEL.coli_usage" \
+  --pin-slots 73 \
+  --max-layers 48
+```
+
+The cost model is approximate. Confirm nearby layer counts with measured tok/s.
+
 ## Important flags
 
 | Flag                    | Meaning                                              |
@@ -86,6 +124,9 @@ When too few LRU slots are available per layer, real GPU prefetch automatically 
 | `PIN=auto`              | Pin experts selected from recorded usage history     |
 | `AUTOPIN=1`             | Enable automatic hot-expert selection                |
 | `PIN_GB=0.05`           | Optionally limit the pinned-expert tier              |
+| `QWEN_FOCUS_LAYER_COUNT=K` | Concentrate hot pins in K automatically chosen layers |
+| `QWEN_FOCUS_GROUP=1`     | Group already-resident selected experts in focused layers |
+| `QWEN_FOCUS_GROUP_MIN=2` | Minimum resident hits required for a grouped launch |
 | `PILOT=0`               | Disable speculative next-layer routing               |
 | `PILOT=1`               | Enable speculative expert prediction                 |
 | `PILOT_REAL=1`          | Request actual speculative GPU residency             |
@@ -110,6 +151,9 @@ A verbose run reports:
        compute_fail=...
        admissions=enabled|disabled
        pilot=...
+       group_calls=...
+       group_experts=...
+       group_fail=...
 ```
 
 `residency_fail=0` and `compute_fail=0` indicate normal CUDA expert execution.
@@ -137,3 +181,60 @@ PIN=auto
 AUTOPIN=1
 CUDA_RESERVE_GB=3.5
 ```
+
+## Focus hot experts into selected layers
+
+`QWEN_FOCUS_LAYER_COUNT=K` keeps the normal per-layer LRU execution slots, but
+concentrates the historical hot pinned tier into exactly `K` automatically
+chosen layers. `K=0` preserves the previous global hot-expert policy.
+
+```bash
+QWEN_ROUTER_GPU=0 \
+QWEN_FOCUS_LAYER_COUNT=3 \
+PILOT=0 \
+PILOT_REAL=0 \
+PIN=auto \
+AUTOPIN=1 \
+CUDA_RESERVE_GB=3.5 \
+./colibri \
+  --gguf "$MODEL" \
+  --device cuda \
+  --prompt 'Tell a short story about France.' \
+  --max-tokens 60 \
+  --verbose
+```
+
+The runtime prints the selected layers and pin counts:
+
+```text
+[FOCUS] Qwen hot pins: requested=3 effective=3 budget=73 layers=12:25,36:24,24:24
+```
+
+### Estimate a layer count from usage history
+
+Use the pin count printed by a normal run:
+
+```bash
+python3 tools/qwen_focus_tool.py recommend \
+  "$MODEL.coli_usage" \
+  --pin-slots 73
+```
+
+This evaluates `K=1..48` against recorded expert selections. It is only a
+history-based estimate.
+
+### Empirically benchmark K=1..48
+
+```bash
+python3 tools/qwen_focus_tool.py benchmark \
+  "$MODEL.coli_usage" \
+  --model "$MODEL" \
+  --binary ./colibri \
+  --max-tokens 60 \
+  --rounds 1 \
+  --include-baseline
+```
+
+The tool restores the identical `.coli_usage` file before every run, writes all
+logs and a CSV, and reports the fastest measured `K`. Running all 48 values can
+take a long time; use `--start` and `--end` for a smaller range.

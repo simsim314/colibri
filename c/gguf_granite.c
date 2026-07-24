@@ -1,5 +1,6 @@
 #include "gguf_granite.h"
 #include "gguf_qwen3next.h"
+#include "gguf_qwen35moe.h"
 #include "tensor.h"
 #include "gguf_tokenizer.h"
 #include "f32_kernels.h"
@@ -765,6 +766,8 @@ int coli_gguf_run_cli(int argc,char**argv){
         if(!strcmp(argv[i],"--prompt")&&i+1<argc)prompt=argv[++i];
         else if(!strcmp(argv[i],"--max-tokens")&&i+1<argc)max_tokens=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--device")&&i+1<argc)device_arg=argv[++i];
+        else if(!strcmp(argv[i],"--mtp-draft")&&i+1<argc)++i; /* qwen35moe dispatch consumes it */
+        else if(!strcmp(argv[i],"--no-mtp")){} /* qwen35moe dispatch consumes it */
         else if(!strcmp(argv[i],"--raw-prompt"))raw=1;
         else if(!strcmp(argv[i],"--verbose")||!strcmp(argv[i],"-v"))verbose=1;
         else {fprintf(stderr,"unknown GGUF option: %s\n",argv[i]);usage(argv[0]);return 2;}
@@ -776,8 +779,13 @@ int coli_gguf_run_cli(int argc,char**argv){
         if(coli_gguf_open(&arch_probe,model_path)){
             const ColiGgufKV *akv=coli_gguf_find_kv(&arch_probe,"general.architecture");
             char *arch=NULL;
-            if(akv&&coli_gguf_kv_read_string(&arch_probe,akv,&arch)&&!strcmp(arch,"qwen3next")){
-                free(arch);coli_gguf_close(&arch_probe);return coli_qwen3next_run_cli(argc,argv);
+            if(akv&&coli_gguf_kv_read_string(&arch_probe,akv,&arch)){
+                if(!strcmp(arch,"qwen3next")){
+                    free(arch);coli_gguf_close(&arch_probe);return coli_qwen3next_run_cli(argc,argv);
+                }
+                if(!strcmp(arch,"qwen35moe")){
+                    free(arch);coli_gguf_close(&arch_probe);return coli_qwen35moe_run_cli(argc,argv);
+                }
             }
             free(arch);coli_gguf_close(&arch_probe);
         }

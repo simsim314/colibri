@@ -17,6 +17,7 @@ static const ColiDTypeTraits k_types[] = {
     { 13, "Q5_K", 256, 176, 1 },
     { 14, "Q6_K", 256, 210, 1 },
     { 15, "Q8_K", 256, 292, 1 },
+    { 30, "BF16", 1,   2,   0 },
 };
 
 const ColiDTypeTraits *coli_dtype_traits(ColiDType type) {

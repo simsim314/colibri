@@ -135,6 +135,21 @@ int coli_expert_usage_top(uint32_t *const *usage, int n_layers, int n_experts,
 int coli_expert_usage_top_file(const char *path, int n_layers, int n_experts,
                                int *flat_ids, int output_cap, int64_t *total);
 
+/* Concentrated hot-tier selection. Choose up to focus_layers layers from the
+ * usage history, then greedily fill output_cap expert pins inside those layers.
+ * Every selected layer receives at least one pin when possible and no layer
+ * receives more than ceil(output_cap / focus_layers), making the requested
+ * layer count an actual concentration control rather than a display hint.
+ * selected_layers/per_layer_counts are optional telemetry outputs. */
+int coli_expert_usage_focus(uint32_t *const *usage, int n_layers, int n_experts,
+                            int focus_layers, int *flat_ids, int output_cap,
+                            int *selected_layers, int selected_cap,
+                            int *per_layer_counts);
+int coli_expert_usage_focus_file(const char *path, int n_layers, int n_experts,
+                                 int focus_layers, int *flat_ids, int output_cap,
+                                 int *selected_layers, int selected_cap,
+                                 int *per_layer_counts, int64_t *total);
+
 #define COLI_EXPERT_COUPLE_M 16
 typedef struct {
     int n_layers, n_experts;

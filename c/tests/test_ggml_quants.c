@@ -13,6 +13,8 @@ int main(void) {
     near(coli_fp16_to_fp32(0x3c00), 1.0f);
     near(coli_fp16_to_fp32(0xc000), -2.0f);
     assert(fabsf(coli_fp16_to_fp32(0x0001) - 5.96046448e-8f) < 1e-12f);
+    near(coli_bf16_to_fp32(0x3f80), 1.0f);
+    near(coli_bf16_to_fp32(0xc000), -2.0f);
 
 
     float y[256];
@@ -20,6 +22,8 @@ int main(void) {
     assert(coli_ggml_dequantize_row(0,f32b,2,y)); near(y[0],1.25f); near(y[1],-3.5f);
     uint8_t f16b[4]; put_u16(f16b,0x3c00); put_u16(f16b+2,0xc000);
     assert(coli_ggml_dequantize_row(1,f16b,2,y)); near(y[0],1); near(y[1],-2);
+    uint8_t bf16b[4]; put_u16(bf16b,0x3f80); put_u16(bf16b+2,0xc000);
+    assert(coli_ggml_dequantize_row(30,bf16b,2,y)); near(y[0],1); near(y[1],-2);
 
     uint8_t q40[18] = {0}; put_u16(q40, 0x3c00);
     for (int i=0;i<16;i++) q40[2+i]=(uint8_t)(i | ((15-i)<<4));

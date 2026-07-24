@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 float coli_fp16_to_fp32(uint16_t h);
+float coli_bf16_to_fp32(uint16_t h);
 int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
                               uint64_t element_count, float *output);
 float coli_dtype_dot_f32(ColiDType type, const void *encoded,

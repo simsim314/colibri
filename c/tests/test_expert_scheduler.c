@@ -69,6 +69,27 @@ int main(void){
         assert(ids[0]==10&&ids[1]==3);remove(path);
     }
     {
+        uint32_t a[4]={100,90,10,1},b[4]={80,70,2,1};
+        uint32_t c[4]={60,50,40,1},d[4]={30,20,10,1};
+        uint32_t *rows[4]={a,b,c,d};
+        int ids[6]={-1,-1,-1,-1,-1,-1};
+        int selected[2]={-1,-1},counts[4]={0};
+        int n=coli_expert_usage_focus(rows,4,4,2,ids,4,selected,2,counts);
+        assert(n==4);
+        assert(selected[0]==0&&selected[1]==1);
+        assert(counts[0]==2&&counts[1]==2&&counts[2]==0&&counts[3]==0);
+        assert(ids[0]==0&&ids[1]==4&&ids[2]==1&&ids[3]==5);
+        memset(ids,-1,sizeof(ids));memset(counts,0,sizeof(counts));selected[0]=selected[1]=-1;
+        n=coli_expert_usage_focus(rows,4,4,1,ids,3,selected,2,counts);
+        assert(n==3&&selected[0]==0&&counts[0]==3);
+        assert(ids[0]==0&&ids[1]==1&&ids[2]==2);
+        memset(ids,-1,sizeof(ids));memset(counts,0,sizeof(counts));
+        int selected4[4]={-1,-1,-1,-1};
+        n=coli_expert_usage_focus(rows,4,4,4,ids,4,selected4,4,counts);
+        assert(n==4);
+        for(int l=0;l<4;l++)assert(counts[l]==1);
+    }
+    {
         const char *path="tmp_expert_pairs.txt";FILE*f=fopen(path,"w");assert(f);
         fputs("COLIPAIRS 1 2\n0 1 2 5:3.0 6:1.0\n0 1 3 6:4.0 5:1.0\n",f);fclose(f);
         ColiExpertCoupling cp={0};long used=0;assert(coli_expert_coupling_load(&cp,path,2,8,&used));assert(used==2);

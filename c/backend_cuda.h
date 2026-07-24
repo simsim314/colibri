@@ -56,7 +56,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      int fmt, int S, int I, int O, int device, int gs);
 
 /* Native Colibri/GGUF dtype matmul. `weights` points to encoded GGML rows
- * (F32/F16/Q4_K/Q5_K/Q6_K in the first CUDA implementation). The encoded
+ * (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K). The encoded
  * bytes are staged to reusable VRAM scratch and decoded inside the kernel; no
  * persistent F32 weight copy is created. */
 COLI_CUDA_DLLEXPORT int coli_cuda_ggml_matmul(float *y, const float *x,
@@ -146,6 +146,7 @@ COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm(int device,float *y_dev,const float *x_dev,
                            const float *w_dev,int S,int D,float eps);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope(int device,float *v_dev,const int *pos_dev,int rows,
@@ -184,6 +185,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sigmoid_scale(int device,float *x_dev,con
  * already -exp(A_log). State is kept transposed per head: [column][key_dim]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_gated_delta_decode(int device,float *out_dev,
         const float *qkv_dev,const float *z_dev,const float *ba_dev,
+        const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,
+        const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,
+        int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps);
+/* Qwen3.5-MoE variant: beta and alpha are independent family-major
+ * projections [n_value_heads], rather than Qwen3-Next's grouped BA tensor. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_gated_delta_decode_separate(int device,float *out_dev,
+        const float *qkv_dev,const float *z_dev,const float *beta_dev,const float *alpha_dev,
         const float *conv_weight_dev,const float *dt_bias_dev,const float *a_dev,
         const float *norm_weight_dev,float *conv_state_dev,float *recurrent_state_dev,
         int n_key_heads,int n_value_heads,int head_dim,int conv_kernel,float eps);

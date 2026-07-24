@@ -19,6 +19,7 @@ typedef enum {
     COLI_DTYPE_Q5_K = 13,
     COLI_DTYPE_Q6_K = 14,
     COLI_DTYPE_Q8_K = 15,
+    COLI_DTYPE_BF16 = 30,
 } ColiDType;
 
 typedef struct {
