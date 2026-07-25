@@ -68,6 +68,18 @@ COLI_CUDA_DLLEXPORT int coli_cuda_ggml_matmul(float *y, const float *x,
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_ggml(ColiCudaTensor **tensor,
                            const void *weights, uint32_t dtype,
                            uint64_t weight_bytes, int I, int O, int device);
+/* Native SGGUF sparse tensor residency. `block_offsets_le` addresses the full
+ * mapped sparse tensor; first_block/block_count select a row view. Only the
+ * selected variable-length blocks and a normalized offset table are uploaded. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_sgguf(ColiCudaTensor **tensor,
+                           const uint8_t *block_offsets_le,
+                           const uint8_t *blocks,
+                           uint64_t first_block, uint64_t block_count,
+                           uint32_t codec_id, uint32_t sparse_layout,
+                           uint32_t offset_width,
+                           uint16_t auxiliary_bytes_per_block,
+                           uint16_t retained_value_bits,
+                           int I, int O, int device);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_view_rows(ColiCudaTensor *base,
                            uint64_t first_row, uint64_t row_count,
                            ColiCudaTensor **view);

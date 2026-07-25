@@ -15,4 +15,12 @@ float coli_dtype_dot_f32(ColiDType type, const void *encoded,
 int coli_ggml_dequantize_row(uint32_t type, const void *encoded,
                              uint64_t element_count, float *output);
 
+/* Replace representable encoded values whose decoded magnitude is below
+ * threshold with an exact encoded zero, without changing the tensor dtype or
+ * storage size. Currently supports F32/F16/BF16, Q6_K, Q8_0/Q8_1, and Q8_K.
+ * changed_out receives the number of nonzero values changed to zero. */
+int coli_dtype_zero_below_inplace(ColiDType type, void *encoded,
+                                  uint64_t element_count, float threshold,
+                                  uint64_t *changed_out);
+
 #endif

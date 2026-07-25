@@ -1,4 +1,5 @@
 #include "backend_cuda.h"
+#include "sgguf.h"
 
 #include "backend_gpu_compat.h"
 
@@ -23,11 +24,19 @@ struct RaggedKVEntry {
 struct ColiCudaTensor {
     void *weights;
     float *scales;
+    void *sparse_offsets;
     size_t weight_bytes;
+    size_t sparse_index_bytes;
     int fmt, I, O, device;
     uint32_t ggml_type;
+    uint32_t sparse_codec;
+    uint32_t sparse_layout;
+    uint16_t sparse_aux_bytes;
+    uint16_t sparse_value_bits;
     size_t native_row_bytes;
     int native_ggml;
+    int native_sgguf;
+    int sparse_blocks_per_row;
     int owns_weights;
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
@@ -64,6 +73,20 @@ typedef struct {
     size_t grb,urb,drb;   /* native encoded row sizes */
     int native_ggml;
 } GroupDesc;
+
+static GroupDesc make_group_desc(const ColiCudaTensor *g,const ColiCudaTensor *u,
+                                 const ColiCudaTensor *d,int rows,int offset){
+    GroupDesc out{};
+    out.g=g->weights;out.u=u->weights;out.d=d->weights;
+    out.gs=g->scales;out.us=u->scales;out.ds=d->scales;
+    out.gf=g->fmt;out.uf=u->fmt;out.df=d->fmt;
+    out.rows=rows;out.offset=offset;
+    out.ggs=g->gs;out.ugs=u->gs;out.dgs=d->gs;
+    out.gt=g->ggml_type;out.ut=u->ggml_type;out.dt=d->ggml_type;
+    out.grb=g->native_row_bytes;out.urb=u->native_row_bytes;out.drb=d->native_row_bytes;
+    out.native_ggml=g->native_ggml&&u->native_ggml&&d->native_ggml;
+    return out;
+}
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
@@ -257,6 +280,217 @@ __global__ static void ggml_quant_matmul(float *y,const float *x,const uint8_t *
     if(!threadIdx.x)y[(size_t)s*O+o]=sh[0];
 }
 
+__device__ static uint32_t sgguf_read_bits(const uint8_t *p,uint32_t bit_offset,uint32_t bits){
+    uint32_t byte=bit_offset>>3,shift=bit_offset&7u,need=(shift+bits+7u)>>3;
+    unsigned long long v=0;
+    for(uint32_t i=0;i<need;i++)v|=(unsigned long long)p[byte+i]<<(8u*i);
+    unsigned long long mask=bits==32?0xffffffffull:((1ull<<bits)-1ull);
+    return (uint32_t)((v>>shift)&mask);
+}
+
+__device__ static int sgguf_mask_range(uint32_t mask[8],uint32_t left,uint32_t right){
+    if(left>=right||right>256u)return 0;
+    uint32_t first_word=left>>5,last_word=(right-1u)>>5;
+    uint32_t first_bit=left&31u,last_bit=(right-1u)&31u;
+    if(first_word==last_word){
+        uint32_t low=0xffffffffu<<first_bit;
+        uint32_t high=last_bit==31u?0xffffffffu:((1u<<(last_bit+1u))-1u);
+        mask[first_word]|=low&high;
+        return 1;
+    }
+    mask[first_word]|=0xffffffffu<<first_bit;
+    for(uint32_t word=first_word+1u;word<last_word;word++)mask[word]=0xffffffffu;
+    mask[last_word]|=last_bit==31u?0xffffffffu:((1u<<(last_bit+1u))-1u);
+    return 1;
+}
+
+__device__ static int sgguf_decode_tree_device(const uint8_t *tree,uint32_t tree_bits,
+                                                uint32_t mask[8],uint32_t *retained){
+    int left[16],right[16],top=1;uint32_t pos=0;
+    if(!tree||!mask||!retained||tree_bits<2u)return 0;
+    for(int i=0;i<8;i++)mask[i]=0;
+    left[0]=0;right[0]=256;
+    while(top){
+        --top;int l=left[top],r=right[top];
+        if(l<0||r>256||l>=r||pos>=tree_bits)return 0;
+        uint32_t first=(tree[pos>>3]>>(pos&7u))&1u;pos++;
+        if(!first){
+            if(r-l<=1||top+2>16)return 0;
+            int m=l+(r-l)/2;
+            left[top]=m;right[top]=r;top++;
+            left[top]=l;right[top]=m;top++;
+        }else{
+            if(pos>=tree_bits)return 0;
+            uint32_t keep=(tree[pos>>3]>>(pos&7u))&1u;pos++;
+            if(keep&&!sgguf_mask_range(mask,(uint32_t)l,(uint32_t)r))return 0;
+        }
+    }
+    if(pos!=tree_bits)return 0;
+    uint32_t n=0;for(int i=0;i<8;i++)n+=(uint32_t)__popc(mask[i]);
+    *retained=n;return 1;
+}
+
+__device__ static void sgguf_scale_min_k4(int j,const uint8_t *q,uint8_t *d,uint8_t *m){
+    if(j<4){*d=q[j]&63u;*m=q[j+4]&63u;}
+    else {*d=(q[j+4]&15u)|((q[j-4]>>6)<<4);*m=(q[j+4]>>4)|((q[j]>>6)<<4);}
+}
+
+__device__ static int sgguf_q3_scale(const uint8_t *p,uint32_t index){
+    uint32_t aux[4]={ggml_u32(p),ggml_u32(p+4),ggml_u32(p+8),0};
+    const uint32_t k1=0x03030303u,k2=0x0f0f0f0fu;uint32_t tmp=aux[2];
+    aux[2]=((aux[0]>>4)&k2)|(((tmp>>4)&k1)<<4);
+    aux[3]=((aux[1]>>4)&k2)|(((tmp>>6)&k1)<<4);
+    aux[0]=(aux[0]&k2)|(((tmp>>0)&k1)<<4);
+    aux[1]=(aux[1]&k2)|(((tmp>>2)&k1)<<4);
+    return (int)((const uint8_t*)aux)[index]-32;
+}
+
+__device__ static float sgguf_sparse_value(uint32_t codec,const uint8_t *aux,
+                                            const uint8_t *values,uint32_t dense,
+                                            uint32_t retained_index){
+    if(codec==COLI_SGGUF_CODEC_RETAINED_F16)
+        return ggml_f16(values+(size_t)retained_index*2);
+    if(codec==COLI_SGGUF_CODEC_RETAINED_BF16)
+        return ggml_bf16(values+(size_t)retained_index*2);
+    if(codec==COLI_SGGUF_CODEC_RETAINED_F32)
+        return ggml_f32(values+(size_t)retained_index*4);
+    if(codec==COLI_SGGUF_CODEC_Q4_0_EXACT){
+        uint32_t n=dense>>5,code=sgguf_read_bits(values,retained_index*4u,4);
+        return ggml_f16(aux+n*2u)*((int)code-8);
+    }
+    if(codec==COLI_SGGUF_CODEC_Q4_1_EXACT){
+        const uint8_t *a=aux+(dense>>5)*4u;uint32_t code=sgguf_read_bits(values,retained_index*4u,4);
+        return ggml_f16(a)*code+ggml_f16(a+2);
+    }
+    if(codec==COLI_SGGUF_CODEC_Q5_0_EXACT){
+        uint32_t n=dense>>5,code=sgguf_read_bits(values,retained_index*5u,5);
+        return ggml_f16(aux+n*2u)*((int)code-16);
+    }
+    if(codec==COLI_SGGUF_CODEC_Q5_1_EXACT){
+        const uint8_t *a=aux+(dense>>5)*4u;uint32_t code=sgguf_read_bits(values,retained_index*5u,5);
+        return ggml_f16(a)*code+ggml_f16(a+2);
+    }
+    if(codec==COLI_SGGUF_CODEC_Q8_0_EXACT||codec==COLI_SGGUF_CODEC_Q8_1_EXACT){
+        uint32_t stride=codec==COLI_SGGUF_CODEC_Q8_0_EXACT?2u:4u;
+        uint32_t code=sgguf_read_bits(values,retained_index*8u,8);
+        return ggml_f16(aux+(dense>>5)*stride)*(float)(int8_t)code;
+    }
+    if(codec==COLI_SGGUF_CODEC_Q3_K_EXACT){
+        uint32_t code=sgguf_read_bits(values,retained_index*3u,3);
+        return ggml_f16(aux+12)*sgguf_q3_scale(aux,dense>>4)*((int)code-4);
+    }
+    if(codec==COLI_SGGUF_CODEC_Q4_K_EXACT||codec==COLI_SGGUF_CODEC_Q5_K_EXACT){
+        uint32_t bits=codec==COLI_SGGUF_CODEC_Q4_K_EXACT?4u:5u;
+        uint32_t code=sgguf_read_bits(values,retained_index*bits,bits);
+        uint8_t sc=0,m=0;sgguf_scale_min_k4((int)(dense>>5),aux+4,&sc,&m);
+        return ggml_f16(aux)*sc*code-ggml_f16(aux+2)*m;
+    }
+    if(codec==COLI_SGGUF_CODEC_Q6_K_EXACT){
+        uint32_t code=sgguf_read_bits(values,retained_index*6u,6),half=dense>>7,r=dense&127u;
+        uint32_t group=r>>5,local=r&31u,si=half*8u+group*2u+local/16u;
+        return ggml_f16(aux+16)*(float)(int8_t)aux[si]*((int)code-32);
+    }
+    if(codec==COLI_SGGUF_CODEC_Q8_K_EXACT){
+        uint32_t code=sgguf_read_bits(values,retained_index*8u,8);
+        return ggml_f32(aux)*(float)(int8_t)code;
+    }
+    return 0.f;
+}
+
+__global__ static void sgguf_sparse_matmul(float *y,const float *x,
+        const uint8_t *blocks,const uint64_t *offsets,uint32_t codec,
+        uint32_t sparse_layout,uint16_t fixed_aux_bytes,uint16_t fixed_value_bits,
+        int blocks_per_row,int S,int I,int O){
+    int o=(int)blockIdx.x,s=(int)blockIdx.y,tid=(int)threadIdx.x;
+    const float *xs=x+(size_t)s*I;float sum=0.f;
+    __shared__ uint32_t occupancy[8];
+    __shared__ int valid;
+    __shared__ uint32_t retained_count_shared;
+    __shared__ const uint8_t *aux_shared;
+    __shared__ const uint8_t *values_shared;
+    for(int b=0;b<blocks_per_row;b++){
+        uint64_t bi=(uint64_t)o*blocks_per_row+(uint32_t)b;
+        uint64_t begin=offsets[bi],end=offsets[bi+1];
+        const uint8_t *p=blocks+begin;
+        if(tid==0){
+            valid=0;retained_count_shared=0;aux_shared=nullptr;values_shared=nullptr;
+            if(end>=begin){
+                if(sparse_layout==COLI_SGGUF_LAYOUT_BITMAP_V2){
+                    uint64_t minimum=COLI_SGGUF_BITMAP_BYTES+(uint64_t)fixed_aux_bytes;
+                    if(end-begin>=minimum&&fixed_value_bits){
+                        uint32_t retained=0;
+                        for(int w=0;w<8;w++){
+                            occupancy[w]=ggml_u32(p+w*4);
+                            retained+=(uint32_t)__popc(occupancy[w]);
+                        }
+                        uint64_t value_bytes=((uint64_t)retained*fixed_value_bits+7u)/8u;
+                        valid=(minimum+value_bytes==end-begin);
+                        retained_count_shared=retained;
+                        aux_shared=p+COLI_SGGUF_BITMAP_BYTES;
+                        values_shared=aux_shared+fixed_aux_bytes;
+                    }
+                }else{
+                    if(end-begin>=COLI_SGGUF_SPARSE_BLOCK_HEADER_BYTES){
+                        uint16_t tree_bits=ggml_u16(p),retained_count=ggml_u16(p+2);
+                        uint16_t aux_bytes=ggml_u16(p+4),value_bits=ggml_u16(p+6);
+                        uint32_t value_bytes=ggml_u32(p+8),encoded_bytes=ggml_u32(p+12);
+                        uint32_t tree_bytes=(tree_bits+7u)/8u;
+                        const uint8_t *tree=p+COLI_SGGUF_SPARSE_BLOCK_HEADER_BYTES;
+                        const uint8_t *aux=tree+tree_bytes,*values=aux+aux_bytes;
+                        uint32_t retained=0;
+                        valid=encoded_bytes==end-begin&&
+                              COLI_SGGUF_SPARSE_BLOCK_HEADER_BYTES+tree_bytes+aux_bytes+value_bytes<=encoded_bytes&&
+                              sgguf_decode_tree_device(tree,tree_bits,occupancy,&retained)&&
+                              retained==retained_count&&
+                              ((uint32_t)retained_count*value_bits+7u)/8u==value_bytes;
+                        retained_count_shared=retained;
+                        aux_shared=aux;values_shared=values;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if(!valid){if(tid==0)y[(size_t)s*O+o]=0.f;return;}
+        uint32_t word=(uint32_t)tid>>5,bit=(uint32_t)tid&31u;
+        if((occupancy[word]>>bit)&1u){
+            uint32_t k=0;
+            for(uint32_t w=0;w<word;w++)k+=(uint32_t)__popc(occupancy[w]);
+            uint32_t lower=bit?((1u<<bit)-1u):0u;
+            k+=(uint32_t)__popc(occupancy[word]&lower);
+            if(k<retained_count_shared){
+                float weight=sgguf_sparse_value(codec,aux_shared,values_shared,(uint32_t)tid,k);
+                sum+=weight*xs[(size_t)b*256u+(uint32_t)tid];
+            }
+        }
+        __syncthreads();
+    }
+    __shared__ float sh[256];sh[tid]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(tid<n)sh[tid]+=sh[tid+n];__syncthreads();}
+    if(!tid)y[(size_t)s*O+o]=sh[0];
+}
+
+static int launch_tensor_matmul(ColiCudaTensor *t,float *y,const float *x,
+                                int S,cudaStream_t stream,const char *what){
+    if(!t||!y||!x||S<1)return 0;
+    dim3 grid((unsigned)t->O,(unsigned)S);
+    if(t->native_sgguf){
+        if(!t->weights||!t->sparse_offsets||!t->sparse_blocks_per_row)return 0;
+        sgguf_sparse_matmul<<<grid,256,0,stream>>>(y,x,(const uint8_t*)t->weights,
+            (const uint64_t*)t->sparse_offsets,t->sparse_codec,t->sparse_layout,
+            t->sparse_aux_bytes,t->sparse_value_bits,t->sparse_blocks_per_row,
+            S,t->I,t->O);
+    }else if(t->native_ggml){
+        if(!t->weights||!t->native_row_bytes)return 0;
+        ggml_quant_matmul<<<grid,256,0,stream>>>(y,x,(const uint8_t*)t->weights,
+            t->ggml_type,S,t->I,t->O,t->native_row_bytes);
+    }else{
+        if(!t->weights||(t->fmt&&!t->scales))return 0;
+        quant_matmul<<<grid,256,0,stream>>>(y,x,t->weights,t->scales,t->fmt,S,t->I,t->O,
+            row_bytes(t->fmt,t->I),t->gs,t->ng);
+    }
+    return cuda_ok(cudaGetLastError(),what);
+}
+
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -436,24 +670,24 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
  * same grouped launch shape as the mature per-row W4 path. */
 __global__ static void grouped_hidden_ggml_dual(float *gate,float *up,const float *x,
                                                 const GroupDesc *desc,int I,int D){
-    int o=blockIdx.x,c=blockIdx.z;GroupDesc d=desc[c];
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*d.grb;
     const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*d.urb;
-    const float *xs=x+(size_t)c*D;float ga=0.f,ua=0.f;
+    const float *xs=x+(size_t)(d.offset+s)*D;float ga=0.f,ua=0.f;
     for(int i=threadIdx.x;i<D;i+=blockDim.x){float xv=xs[i];ga+=xv*ggml_weight(gr,d.gt,i);ua+=xv*ggml_weight(ur,d.ut,i);}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
-    if(!threadIdx.x){gate[(size_t)c*I+o]=gp[0];up[(size_t)c*I+o]=upv[0];}
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;gate[z]=gp[0];up[z]=upv[0];}
 }
 
 __global__ static void grouped_down_ggml(float *y,const float *x,const GroupDesc *desc,int D,int I){
-    int o=blockIdx.x,c=blockIdx.z;GroupDesc d=desc[c];
+    int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *row=(const uint8_t*)d.d+(size_t)o*d.drb;
-    const float *xs=x+(size_t)c*I;float sum=0.f;
+    const float *xs=x+(size_t)(d.offset+s)*I;float sum=0.f;
     for(int i=threadIdx.x;i<I;i+=blockDim.x)sum+=xs[i]*ggml_weight(row,d.dt,i);
     __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
-    if(!threadIdx.x)y[(size_t)c*D+o]=p[0];
+    if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
 }
 
 /* fmt=4 grouped-int4 variants (#334): identical structure to the w4 kernels,
@@ -793,7 +1027,6 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
     return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
         cudaMemcpyHostToDevice),"scale refresh");
@@ -881,9 +1114,61 @@ extern "C" int coli_cuda_tensor_upload_ggml(ColiCudaTensor **tensor,
     *tensor=t;return 1;
 }
 
+static uint64_t sgguf_host_offset(const uint8_t *p,uint64_t index,uint32_t width){
+    if(width==4){const uint8_t *q=p+index*4u;return (uint64_t)q[0]|((uint64_t)q[1]<<8)|((uint64_t)q[2]<<16)|((uint64_t)q[3]<<24);}
+    if(width==8){const uint8_t *q=p+index*8u;uint64_t v=0;for(int i=0;i<8;i++)v|=(uint64_t)q[i]<<(8*i);return v;}
+    return UINT64_MAX;
+}
+
+extern "C" int coli_cuda_tensor_upload_sgguf(ColiCudaTensor **tensor,
+        const uint8_t *block_offsets_le,const uint8_t *blocks,
+        uint64_t first_block,uint64_t block_count,uint32_t codec_id,
+        uint32_t sparse_layout,uint32_t offset_width,
+        uint16_t auxiliary_bytes_per_block,uint16_t retained_value_bits,
+        int I,int O,int device){
+    if(!tensor||!block_offsets_le||!blocks||I<1||O<1||I%256||!block_count||
+       (offset_width!=4&&offset_width!=8))return 0;
+    uint64_t expected=(uint64_t)O*(uint64_t)(I/256);
+    if(block_count!=expected||block_count>SIZE_MAX/sizeof(uint64_t)-1u)return 0;
+    uint64_t first=sgguf_host_offset(block_offsets_le,first_block,offset_width);
+    uint64_t last=sgguf_host_offset(block_offsets_le,first_block+block_count,offset_width);
+    if(first==UINT64_MAX||last==UINT64_MAX||last<first||last-first>SIZE_MAX)return 0;
+    size_t block_bytes=(size_t)(last-first);
+    size_t index_bytes=(size_t)(block_count+1u)*sizeof(uint64_t);
+    if(*tensor){
+        ColiCudaTensor *t=*tensor;
+        return t->native_sgguf&&t->sparse_codec==codec_id&&t->sparse_layout==sparse_layout&&
+               t->sparse_aux_bytes==auxiliary_bytes_per_block&&
+               t->sparse_value_bits==retained_value_bits&&t->I==I&&t->O==O&&
+               t->device==device&&t->weight_bytes==block_bytes&&t->sparse_index_bytes==index_bytes;
+    }
+    uint64_t *host_offsets=(uint64_t*)std::malloc(index_bytes);if(!host_offsets)return 0;
+    for(uint64_t i=0;i<=block_count;i++){
+        uint64_t off=sgguf_host_offset(block_offsets_le,first_block+i,offset_width);
+        if(off==UINT64_MAX||off<first||off>last){std::free(host_offsets);return 0;}
+        host_offsets[i]=off-first;
+    }
+    DeviceContext *ctx=find_ctx(device);if(!select_ctx(ctx)){std::free(host_offsets);return 0;}
+    ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t));if(!t){std::free(host_offsets);return 0;}
+    t->I=I;t->O=O;t->device=device;t->sparse_codec=codec_id;t->sparse_layout=sparse_layout;
+    t->sparse_aux_bytes=auxiliary_bytes_per_block;t->sparse_value_bits=retained_value_bits;
+    t->native_sgguf=1;t->sparse_blocks_per_row=I/256;t->owns_weights=1;t->weight_bytes=block_bytes;
+    t->sparse_index_bytes=index_bytes;
+    int ok=cuda_ok(cudaMalloc(&t->weights,block_bytes),"SGGUF sparse block allocation")&&
+           cuda_ok(cudaMalloc(&t->sparse_offsets,index_bytes),"SGGUF sparse index allocation")&&
+           cuda_ok(cudaMemcpy(t->weights,blocks+first,block_bytes,cudaMemcpyHostToDevice),
+                   "SGGUF sparse block upload")&&
+           cuda_ok(cudaMemcpy(t->sparse_offsets,host_offsets,index_bytes,cudaMemcpyHostToDevice),
+                   "SGGUF sparse index upload");
+    std::free(host_offsets);
+    if(!ok){coli_cuda_tensor_free(t);return 0;}
+    t->tracked=1;ctx->tensor_count++;ctx->tensor_bytes+=block_bytes+index_bytes;
+    *tensor=t;return 1;
+}
+
 extern "C" int coli_cuda_tensor_view_rows(ColiCudaTensor *base,
         uint64_t first_row,uint64_t row_count,ColiCudaTensor **view){
-    if(!base||!view||*view||!base->native_ggml||!row_count||
+    if(!base||!view||*view||!base->native_ggml||base->native_sgguf||!row_count||
        first_row>(uint64_t)base->O||row_count>(uint64_t)base->O-first_row||
        row_count>(uint64_t)INT_MAX) return 0;
     if(first_row>SIZE_MAX/base->native_row_bytes) return 0;
@@ -908,14 +1193,7 @@ extern "C" int coli_cuda_tensor_matmul_host(ColiCudaTensor *t,float *y,
     size_t xb=(size_t)S*t->I*sizeof(float),yb=(size_t)S*t->O*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb))return 0;
     if(!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"resident input upload"))return 0;
-    dim3 grid((unsigned)t->O,(unsigned)S);
-    if(t->native_ggml)
-        ggml_quant_matmul<<<grid,256>>>(ctx->y,ctx->x,(const uint8_t*)t->weights,
-            t->ggml_type,S,t->I,t->O,t->native_row_bytes);
-    else
-        quant_matmul<<<grid,256>>>(ctx->y,ctx->x,t->weights,t->scales,t->fmt,S,t->I,t->O,
-            row_bytes(t->fmt,t->I),t->gs,t->ng);
-    return cuda_ok(cudaGetLastError(),"resident matmul launch")&&
+    return launch_tensor_matmul(t,ctx->y,ctx->x,S,0,"resident matmul launch")&&
            cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"resident output download");
 }
 
@@ -940,17 +1218,13 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
         !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
-    dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
-    quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
-        gate->fmt,S,D,I,row_bytes(gate->fmt,D),gate->gs,gate->ng);
-    quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
-        up->fmt,S,D,I,row_bytes(up->fmt,D),up->gs,up->ng);
+    if(!launch_tensor_matmul(gate,ctx->gate,ctx->x,S,0,"expert gate launch")||
+       !launch_tensor_matmul(up,ctx->up,ctx->x,S,0,"expert up launch")) return 0;
     size_t n=(size_t)S*I;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
-    quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
-        down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
-    if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
-        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
+    if(!cuda_ok(cudaGetLastError(),"expert activation launch")||
+       !launch_tensor_matmul(down,ctx->y,ctx->gate,S,0,"expert down launch")||
+       !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
     return 1;
 }
 
@@ -994,18 +1268,22 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0;
+    int all_s4=1,all_q4=1,any_g4=0,all_native=1,all_legacy=1,needs_direct=0;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
-        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,rows[c],total,
-                 g->gs,u->gs,d->gs};
-        all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
-        all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
-                !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
-        any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
+        host[c]=make_group_desc(g,u,d,rows[c],total);
+        int native=host[c].native_ggml&&host[c].grb&&host[c].urb&&host[c].drb;
+        int sparse=g->native_sgguf||u->native_sgguf||d->native_sgguf;
+        int legacy=!g->native_ggml&&!u->native_ggml&&!d->native_ggml&&!sparse;
+        all_native&=native;
+        all_legacy&=legacy;
+        needs_direct|=sparse||(!native&&!legacy);
+        all_s4&=legacy&&g->fmt==2&&u->fmt==2&&d->fmt==2;
+        all_q4&=legacy&&(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&
+                (d->fmt==2||d->fmt==4)&&!(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);
+        any_g4|=legacy&&(g->fmt==4||u->fmt==4||d->fmt==4);
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
@@ -1035,7 +1313,24 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
-    if(tc){
+    if(needs_direct||(!all_native&&!all_legacy)){
+        for(int c=0;c<count;c++){
+            int r=rows[c],off=host[c].offset;
+            float *gout=ctx->gate+(size_t)off*I,*uout=ctx->up+(size_t)off*I;
+            float *xin=ctx->x+(size_t)off*D,*yout=ctx->y+(size_t)off*D;
+            if(!launch_tensor_matmul(gates[c],gout,xin,r,ctx->stream,"expert group gate launch")||
+               !launch_tensor_matmul(ups[c],uout,xin,r,ctx->stream,"expert group up launch"))return 0;
+            silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(gout,uout,(size_t)r*I);
+            if(!cuda_ok(cudaGetLastError(),"expert group activation launch")||
+               !launch_tensor_matmul(downs[c],yout,gout,r,ctx->stream,"expert group down launch"))return 0;
+        }
+    }else if(all_native){
+        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
+        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+        grouped_hidden_ggml_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_down_ggml<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
            !reserve(&ctx->qscale,&ctx->qscale_cap,(size_t)(total+7)*sizeof(float)))return 0;
@@ -1158,9 +1453,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
-        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,rows[c],total,
-                 g->gs,u->gs,d->gs};
+        host[c]=make_group_desc(g,u,d,rows[c],total);
         total+=rows[c];
     }
     if(total>8) return 0;                       /* decode-scale only */
@@ -1177,13 +1470,11 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         int r=rows[c];
         float *g16=ctx->gate+(size_t)host[c].offset*I,*u16=ctx->up+(size_t)host[c].offset*I;
         float *x16=ctx->x+(size_t)host[c].offset*D,*y16=ctx->y+(size_t)host[c].offset*D;
-        quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
-            host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),0,1);
-        quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
-            host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),0,1);
+        if(!launch_tensor_matmul(gates[c],g16,x16,r,ctx->stream,"expert group issue gate")||
+           !launch_tensor_matmul(ups[c],u16,x16,r,ctx->stream,"expert group issue up"))return 0;
         silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
-        quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
-            host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
+        if(!cuda_ok(cudaGetLastError(),"expert group issue activation")||
+           !launch_tensor_matmul(downs[c],y16,g16,r,ctx->stream,"expert group issue down"))return 0;
     }
     if(!cuda_ok(cudaGetLastError(),"expert group issue launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
@@ -1361,12 +1652,15 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
         int ng = tensor->ng > 0 ? tensor->ng : 1;
-        size_t bytes = tensor->weight_bytes + (!tensor->native_ggml && tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+        size_t bytes = tensor->weight_bytes + tensor->sparse_index_bytes +
+                       (!tensor->native_ggml && !tensor->native_sgguf && tensor->fmt
+                        ? (size_t)tensor->O * ng * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
     if (tensor->weights && tensor->owns_weights) cudaFree(tensor->weights);
     if (tensor->scales && tensor->owns_weights) cudaFree(tensor->scales);
+    if (tensor->sparse_offsets && tensor->owns_weights) cudaFree(tensor->sparse_offsets);
     for(int i=0;i<tensor->ragged_count;i++){
         if(tensor->ragged[i].latent)cudaFree(tensor->ragged[i].latent);
         if(tensor->ragged[i].rope)cudaFree(tensor->ragged[i].rope);
@@ -1377,6 +1671,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
     if(tensor->native_ggml) return tensor->weight_bytes;
+    if(tensor->native_sgguf) return tensor->weight_bytes+tensor->sparse_index_bytes;
     int ng = tensor->ng > 0 ? tensor->ng : 1;
     return tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
 }
@@ -1922,12 +2217,7 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
-        host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,1,total,
-                 g->gs,u->gs,d->gs,
-                 g->ggml_type,u->ggml_type,d->ggml_type,
-                 g->native_row_bytes,u->native_row_bytes,d->native_row_bytes,
-                 g->native_ggml&&u->native_ggml&&d->native_ggml};
+        host[c]=make_group_desc(g,u,d,1,total);
         all_s4&=!g->native_ggml&&!u->native_ggml&&!d->native_ggml&&
                 g->fmt==2&&u->fmt==2&&d->fmt==2;
         all_native&=g->native_ggml&&u->native_ggml&&d->native_ggml&&
@@ -2100,14 +2390,7 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     if (fault_injected()) return 0;
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
-    dim3 grid((unsigned)t->O,(unsigned)S);
-    if(t->native_ggml)
-        ggml_quant_matmul<<<grid,256>>>(y_dev,x_dev,(const uint8_t*)t->weights,t->ggml_type,
-            S,t->I,t->O,t->native_row_bytes);
-    else
-        quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
-            row_bytes(t->fmt,t->I),t->gs,t->ng);
-    return cuda_ok(cudaGetLastError(),"pipe gemm");
+    return launch_tensor_matmul(t,y_dev,x_dev,S,0,"pipe gemm");
 }
 /* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */
 extern "C" int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,

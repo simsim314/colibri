@@ -1,4 +1,6 @@
 #include "gguf_reader.h"
+#include "sgguf.h"
+#include "ggml_types.h"
 #include "compat.h"
 
 #include <errno.h>
@@ -274,6 +276,26 @@ const ColiGgufTensorInfo *coli_gguf_find_tensor(const ColiGgufFile *g, const cha
     return NULL;
 }
 
+const ColiGgufTensorInfo *coli_gguf_find_moe_tensor(const ColiGgufFile *g,
+                                                    int32_t layer,
+                                                    uint32_t projection) {
+    if (!g || layer < 0 || projection < 1u || projection > 3u) return NULL;
+    /* SGGUF records this index explicitly. Prefer it even if a converter chose
+     * to rename a tensor while preserving its semantic role. */
+    for (uint64_t i = 0; i < g->tensor_count; ++i) {
+        const ColiGgufTensorInfo *t = &g->tensors[i];
+        if (t->moe_layer == layer && t->moe_projection == projection)
+            return t;
+    }
+
+    char name[160];
+    const char *suffix = projection == 1u ? "ffn_gate_exps.weight" :
+                         projection == 2u ? "ffn_up_exps.weight" :
+                                            "ffn_down_exps.weight";
+    snprintf(name, sizeof(name), "blk.%d.%s", (int)layer, suffix);
+    return coli_gguf_find_tensor(g, name);
+}
+
 int coli_gguf_kv_read_u64(const ColiGgufFile *g, const ColiGgufKV *kv, uint64_t *out) {
     if (!g || !kv || !out || kv->type == COLI_GGUF_TYPE_ARRAY) return 0;
     uint8_t u8;
@@ -435,7 +457,8 @@ int coli_gguf_read_tensor_bytes(const ColiGgufFile *g,
                                 void *dst,
                                 size_t bytes) {
     uint64_t off;
-    if (!g || !tensor) return 0;
+    if (!g || !tensor || relative_offset > tensor->payload_size ||
+        (uint64_t)bytes > tensor->payload_size - relative_offset) return 0;
     if (add_overflow_u64(tensor->absolute_offset, relative_offset, &off)) return 0;
     return coli_gguf_read_at(g, off, dst, bytes);
 }
@@ -497,13 +520,23 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
     GgufCursor c = { g, 0 };
     unsigned char magic[4];
     if (!cursor_read(&c, magic, sizeof(magic))) goto fail;
-    if (memcmp(magic, "GGUF", 4) != 0) {
-        gguf_fail(g, "not a GGUF file: bad magic");
+    if (memcmp(magic, "GGUF", 4) == 0) {
+        g->container_kind = COLI_MODEL_CONTAINER_GGUF;
+    } else if (memcmp(magic, COLI_SGGUF_MAGIC, 4) == 0) {
+        g->container_kind = COLI_MODEL_CONTAINER_SGGUF;
+    } else {
+        gguf_fail(g, "not a GGUF/SGGUF file: bad magic");
         goto fail;
     }
     if (!cursor_u32(&c, &g->version)) goto fail;
-    if (g->version != 2 && g->version != 3) {
-        gguf_fail(g, "unsupported GGUF version %u (supported: 2 and 3)", g->version);
+    if (g->container_kind == COLI_MODEL_CONTAINER_GGUF) {
+        if (g->version != 2 && g->version != 3) {
+            gguf_fail(g, "unsupported GGUF version %u (supported: 2 and 3)", g->version);
+            goto fail;
+        }
+    } else if (g->version != COLI_SGGUF_VERSION) {
+        gguf_fail(g, "unsupported SGGUF version %u (supported: %u)",
+                  g->version, COLI_SGGUF_VERSION);
         goto fail;
     }
     if (!cursor_u64(&c, &g->tensor_count) || !cursor_u64(&c, &g->metadata_count)) goto fail;
@@ -555,7 +588,32 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
                 goto fail;
             }
         }
-        if (!cursor_u32(&c, &t->type) || !cursor_u64(&c, &t->offset)) goto fail;
+        if (!cursor_u32(&c, &t->type)) goto fail;
+        t->storage_kind = COLI_TENSOR_STORAGE_DENSE;
+        t->moe_layer = -1;
+        if (g->container_kind == COLI_MODEL_CONTAINER_GGUF) {
+            if (!cursor_u64(&c, &t->offset)) goto fail;
+        } else {
+            uint32_t layer_bits;
+            if (!cursor_u32(&c, &t->storage_kind) ||
+                !cursor_u32(&c, &t->codec_id) ||
+                !cursor_u32(&c, &t->flags) ||
+                !cursor_u64(&c, &t->offset) ||
+                !cursor_u64(&c, &t->payload_size) ||
+                !cursor_u64(&c, &t->index_offset) ||
+                !cursor_u64(&c, &t->index_size) ||
+                !cursor_u32(&c, &layer_bits) ||
+                !cursor_u32(&c, &t->moe_projection) ||
+                !cursor_u32(&c, &t->expert_count) ||
+                !cursor_u32(&c, &t->rows_per_expert)) goto fail;
+            t->moe_layer = (int32_t)layer_bits;
+            if (t->storage_kind != COLI_TENSOR_STORAGE_DENSE &&
+                t->storage_kind != COLI_TENSOR_STORAGE_SPARSE_TREE) {
+                gguf_fail(g, "tensor '%s' has unknown SGGUF storage kind %u",
+                          t->name, t->storage_kind);
+                goto fail;
+            }
+        }
     }
 
     const ColiGgufKV *alignment_kv = coli_gguf_find_kv(g, "general.alignment");
@@ -590,6 +648,43 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
             t->absolute_offset > g->file_size) {
             gguf_fail(g, "tensor '%s' points outside the file", t->name);
             goto fail;
+        }
+        if (g->container_kind == COLI_MODEL_CONTAINER_SGGUF) {
+            if (t->payload_size > g->file_size - t->absolute_offset) {
+                gguf_fail(g, "tensor '%s' payload exceeds SGGUF file", t->name);
+                goto fail;
+            }
+            if (t->index_size) {
+                if (add_overflow_u64(g->data_offset, t->index_offset, &t->index_absolute_offset) ||
+                    t->index_absolute_offset > g->file_size ||
+                    t->index_size > g->file_size - t->index_absolute_offset) {
+                    gguf_fail(g, "tensor '%s' sparse index exceeds SGGUF file", t->name);
+                    goto fail;
+                }
+            }
+        }
+    }
+
+    /* Standard GGUF does not record tensor payload sizes. Derive exact sizes
+     * for supported dtypes and otherwise use the span to the next tensor. */
+    if (g->container_kind == COLI_MODEL_CONTAINER_GGUF) {
+        for (uint64_t i = 0; i < g->tensor_count; ++i) {
+            ColiGgufTensorInfo *t = &g->tensors[i];
+            uint64_t elements = 0, bytes = 0;
+            if (coli_ggml_tensor_size(t->type, t->dims, t->n_dims, &elements, &bytes)) {
+                t->payload_size = bytes;
+            } else {
+                uint64_t next = g->file_size - g->data_offset;
+                for (uint64_t j = 0; j < g->tensor_count; ++j) {
+                    if (g->tensors[j].offset > t->offset && g->tensors[j].offset < next)
+                        next = g->tensors[j].offset;
+                }
+                t->payload_size = next > t->offset ? next - t->offset : 0;
+            }
+            if (t->payload_size > g->file_size - t->absolute_offset) {
+                gguf_fail(g, "tensor '%s' payload exceeds GGUF file", t->name);
+                goto fail;
+            }
         }
     }
 

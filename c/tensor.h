@@ -3,6 +3,7 @@
 
 #include "ggml_types.h"
 #include "gguf_reader.h"
+#include "sgguf.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +38,13 @@ typedef struct {
     uint64_t storage_bytes;
     const uint8_t *data;
     uint64_t source_offset;
+
+    /* Native sparse SGGUF view. For a row/expert view, sparse_first_block and
+     * sparse_block_count select a contiguous range from sparse_tensor. */
+    uint32_t storage_kind;
+    ColiSggufSparseTensor sparse_tensor;
+    uint64_t sparse_first_block;
+    uint64_t sparse_block_count;
     ColiCudaTensor *cuda;
     int cuda_device;
     unsigned owns_data : 1;

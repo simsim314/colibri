@@ -1,6 +1,7 @@
 #include "ggml_quants.h"
 #include "ggml_types.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -251,6 +252,114 @@ float coli_dtype_dot_f32(ColiDType type, const void *encoded,
         p += t->block_bytes;
     }
     return (float)sum;
+}
+
+
+
+static void q6_k_set_exact_zero(uint8_t *p, int idx) {
+    const int half = idx >= 128;
+    const int r = idx - half * 128;
+    const int group = r / 32;
+    const int l = r % 32;
+    uint8_t *ql = p + half * 64;
+    uint8_t *qh = p + 128 + half * 32;
+    if (group == 0) {
+        ql[l] &= 0xf0u;
+        qh[l] = (uint8_t)((qh[l] & ~0x03u) | 0x02u);
+    } else if (group == 1) {
+        ql[l + 32] &= 0xf0u;
+        qh[l] = (uint8_t)((qh[l] & ~0x0cu) | 0x08u);
+    } else if (group == 2) {
+        ql[l] &= 0x0fu;
+        qh[l] = (uint8_t)((qh[l] & ~0x30u) | 0x20u);
+    } else {
+        ql[l + 32] &= 0x0fu;
+        qh[l] = (uint8_t)((qh[l] & ~0xc0u) | 0x80u);
+    }
+}
+
+int coli_dtype_zero_below_inplace(ColiDType type, void *encoded,
+                                  uint64_t element_count, float threshold,
+                                  uint64_t *changed_out) {
+    if (changed_out) *changed_out = 0;
+    if (!encoded || !isfinite(threshold) || threshold < 0.0f) return 0;
+    if (threshold == 0.0f || element_count == 0) return 1;
+    const ColiDTypeTraits *t = coli_dtype_traits(type);
+    if (!t || element_count % t->block_values) return 0;
+
+    uint8_t *p = (uint8_t *)encoded;
+    uint64_t changed = 0;
+    if (type == COLI_DTYPE_F32) {
+        for (uint64_t i = 0; i < element_count; ++i) {
+            float v = load_f32(p + 4u * i);
+            if (v != 0.0f && fabsf(v) < threshold) {
+                memset(p + 4u * i, 0, 4);
+                ++changed;
+            }
+        }
+    } else if (type == COLI_DTYPE_F16 || type == COLI_DTYPE_BF16) {
+        for (uint64_t i = 0; i < element_count; ++i) {
+            uint16_t h = load_u16(p + 2u * i);
+            float v = type == COLI_DTYPE_F16 ? coli_fp16_to_fp32(h) : coli_bf16_to_fp32(h);
+            if (v != 0.0f && fabsf(v) < threshold) {
+                p[2u * i] = 0;
+                p[2u * i + 1] = 0;
+                ++changed;
+            }
+        }
+    } else if (type == COLI_DTYPE_Q6_K) {
+        float decoded[256];
+        const uint64_t blocks = element_count / 256u;
+        for (uint64_t b = 0; b < blocks; ++b) {
+            uint8_t *block = p + b * 210u;
+            if (!coli_dtype_dequantize_row(type, block, 256, decoded)) return 0;
+            for (int i = 0; i < 256; ++i) {
+                if (decoded[i] != 0.0f && fabsf(decoded[i]) < threshold) {
+                    q6_k_set_exact_zero(block, i);
+                    ++changed;
+                }
+            }
+        }
+    } else if (type == COLI_DTYPE_Q8_0 || type == COLI_DTYPE_Q8_1) {
+        const uint32_t header = type == COLI_DTYPE_Q8_0 ? 2u : 4u;
+        const uint64_t blocks = element_count / 32u;
+        for (uint64_t b = 0; b < blocks; ++b) {
+            uint8_t *block = p + b * t->block_bytes;
+            const float d = coli_fp16_to_fp32(load_u16(block));
+            int8_t *q = (int8_t *)(block + header);
+            for (int i = 0; i < 32; ++i) {
+                const float v = d * q[i];
+                if (q[i] != 0 && fabsf(v) < threshold) {
+                    q[i] = 0;
+                    ++changed;
+                }
+            }
+        }
+    } else if (type == COLI_DTYPE_Q8_K) {
+        const uint64_t blocks = element_count / 256u;
+        for (uint64_t b = 0; b < blocks; ++b) {
+            uint8_t *block = p + b * 292u;
+            const float d = load_f32(block);
+            int8_t *q = (int8_t *)(block + 4);
+            for (int i = 0; i < 256; ++i) {
+                const float v = d * q[i];
+                if (q[i] != 0 && fabsf(v) < threshold) {
+                    q[i] = 0;
+                    ++changed;
+                }
+            }
+            int16_t *bsums = (int16_t *)(block + 260);
+            for (int g = 0; g < 16; ++g) {
+                int sum = 0;
+                for (int i = 0; i < 16; ++i) sum += q[g * 16 + i];
+                bsums[g] = (int16_t)sum;
+            }
+        }
+    } else {
+        return 0;
+    }
+    if (changed_out) *changed_out = changed;
+    return 1;
 }
 
 int coli_ggml_dequantize_row(uint32_t type, const void *encoded,

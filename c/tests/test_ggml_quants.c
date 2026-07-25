@@ -71,6 +71,18 @@ int main(void) {
     assert(coli_ggml_dequantize_row(15,q8k,256,y));
     near(y[0],-2); near(y[16],2); near(y[17],-2);
 
+    uint64_t changed = 0;
+    assert(coli_dtype_zero_below_inplace(COLI_DTYPE_Q6_K, q6k, 256, 33.0f, &changed));
+    assert(changed == 256);
+    assert(coli_ggml_dequantize_row(14,q6k,256,y));
+    for (int i=0;i<256;i++) near(y[i],0);
+
+    assert(coli_dtype_zero_below_inplace(COLI_DTYPE_Q8_0, q80, 32, 1.0f, &changed));
+    assert(changed == 2);
+    assert(coli_ggml_dequantize_row(8,q80,32,y));
+    near(y[15],0); near(y[17],0); near(y[14],-1); near(y[18],1);
+    assert(!coli_dtype_zero_below_inplace(COLI_DTYPE_Q4_K, q4k, 256, 0.1f, &changed));
+
     assert(!coli_ggml_dequantize_row(12,q8k,255,y));
     puts("test_ggml_quants: ok");
     return 0;

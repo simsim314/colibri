@@ -1,5 +1,6 @@
 #include "gguf_qwen35moe.h"
 #include "tensor.h"
+#include "ggml_quants.h"
 #include "gguf_tokenizer.h"
 #include "f32_kernels.h"
 #include "expert_scheduler.h"
@@ -25,6 +26,7 @@ static int omp_get_max_threads(void) { return 1; }
 typedef struct {
     int eid;
     ColiTensor *gate, *up, *down;
+    int owns_pruned;
     uint64_t used;
 } Q35ExpertSlot;
 
@@ -130,6 +132,11 @@ typedef struct {
     int cuda_router_gpu_enabled;
     uint64_t cuda_router_gpu_calls;
     uint64_t cuda_router_cpu_fallbacks;
+
+    float expert_zero_threshold;
+    uint64_t expert_prune_materializations;
+    uint64_t expert_prune_values_seen;
+    uint64_t expert_prune_values_zeroed;
 
     int verbose;
     ColiExec exec;
@@ -251,6 +258,20 @@ static int q35_load_layer_tensor(Q35Model *m, int layer, const char *suffix,
     return q35_load_tensor(m, name, out, nd, dims, err, cap);
 }
 
+static int q35_load_moe_tensor(Q35Model *m, int layer, uint32_t projection,
+                               ColiTensor *out, int nd, const uint64_t *dims,
+                               char *err, size_t cap) {
+    const ColiGgufTensorInfo *ti = coli_gguf_find_moe_tensor(&m->gguf, layer, projection);
+    if (!ti) return q35_errf(err, cap, "missing routed-MoE tensor at layer %d projection %u",
+                             layer, projection);
+    if (!coli_tensor_bind_gguf(&m->gguf, ti, out, err, cap)) return 0;
+    if (!q35_tensor_dims(out, nd, dims)) {
+        q35_tensor_free(out);
+        return q35_errf(err, cap, "wrong dimensions for routed-MoE tensor: %s", ti->name);
+    }
+    return 1;
+}
+
 static int q35_load_optional_tensor(Q35Model *m, const char *name, ColiTensor *out,
                                     int nd, const uint64_t *dims, int *present,
                                     char *err, size_t cap) {
@@ -267,6 +288,25 @@ static int q35_load_optional_layer_tensor(Q35Model *m, int layer, const char *su
     char name[192];
     snprintf(name, sizeof(name), "blk.%d.%s", layer, suffix);
     return q35_load_optional_tensor(m, name, out, nd, dims, present, err, cap);
+}
+
+static void q35_slot_clear(Q35ExpertSlot *s) {
+    if (!s) return;
+    if (s->owns_pruned) {
+        if (s->gate) { coli_tensor_destroy(s->gate); free(s->gate); }
+        if (s->up) { coli_tensor_destroy(s->up); free(s->up); }
+        if (s->down) { coli_tensor_destroy(s->down); free(s->down); }
+    }
+    s->gate = s->up = s->down = NULL;
+    s->owns_pruned = 0;
+    s->eid = -1;
+    s->used = 0;
+}
+
+static void q35_layer_slots_free(Q35Layer *l) {
+    if (!l) return;
+    for (int i = 0; i < l->npin; ++i) q35_slot_clear(&l->pin[i]);
+    for (int i = 0; i < l->cache_cap; ++i) q35_slot_clear(&l->cache[i]);
 }
 
 static void q35_layer_free(Q35Layer *l) {
@@ -312,6 +352,7 @@ static void q35_release_state(Q35Model *m) {
 
 static void q35_model_free(Q35Model *m) {
     if (!m) return;
+    if (m->layers) for (int i = 0; i < m->n_layers_all; ++i) q35_layer_slots_free(&m->layers[i]);
     if (m->layers) for (int i = 0; i < m->n_layers_all; ++i) q35_layer_free(&m->layers[i]);
     free(m->layers);
     q35_tensor_free(&m->token_embd);
@@ -497,10 +538,10 @@ static int q35_model_load_weights(Q35Model *m, char *err, size_t cap) {
         d[0] = (uint64_t)m->hidden; d[1] = (uint64_t)m->n_experts;
         if (!q35_load_layer_tensor(m, l, "ffn_gate_inp.weight", &x->router, 2, d, err, cap)) return 0;
         d[0] = (uint64_t)m->hidden; d[1] = (uint64_t)m->expert_ff; d[2] = (uint64_t)m->n_experts;
-        if (!q35_load_layer_tensor(m, l, "ffn_gate_exps.weight", &x->gate_exps, 3, d, err, cap) ||
-            !q35_load_layer_tensor(m, l, "ffn_up_exps.weight", &x->up_exps, 3, d, err, cap)) return 0;
+        if (!q35_load_moe_tensor(m, l, COLI_SGGUF_MOE_GATE, &x->gate_exps, 3, d, err, cap) ||
+            !q35_load_moe_tensor(m, l, COLI_SGGUF_MOE_UP, &x->up_exps, 3, d, err, cap)) return 0;
         d[0] = (uint64_t)m->expert_ff; d[1] = (uint64_t)m->hidden; d[2] = (uint64_t)m->n_experts;
-        if (!q35_load_layer_tensor(m, l, "ffn_down_exps.weight", &x->down_exps, 3, d, err, cap)) return 0;
+        if (!q35_load_moe_tensor(m, l, COLI_SGGUF_MOE_DOWN, &x->down_exps, 3, d, err, cap)) return 0;
 
         d[0] = (uint64_t)m->hidden;
         if (!q35_load_layer_tensor(m, l, "ffn_gate_inp_shexp.weight", &x->shared_gate_inp, 1, d, err, cap)) return 0;
@@ -647,6 +688,57 @@ static int q35_mm_cpu_s(float *y, const float *x, ColiTensor *w, int S,
     return 1;
 }
 
+static int q35_mm_cpu_thresholded_s(float *y, const float *x, ColiTensor *w,
+                                      int S, int I, int O, float threshold,
+                                      char *err, size_t cap) {
+    const ColiDTypeTraits *traits = w ? coli_dtype_traits(w->dtype) : NULL;
+    if (!y || !x || !w || !w->data || !traits || S < 1 || I < 1 || O < 1 ||
+        w->dims[0] != (uint64_t)I || w->row_count != (uint64_t)O ||
+        I % (int)traits->block_values)
+        return q35_errf(err, cap, "invalid thresholded expert matmul for %s",
+                        w && w->name ? w->name : "<unnamed>");
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; ++o) {
+        const uint8_t *row = w->data + (uint64_t)o * w->row_bytes;
+        for (int ss = 0; ss < S; ++ss) {
+            const float *xs = x + (size_t)ss * I;
+            const uint8_t *block = row;
+            double sum = 0.0;
+            float decoded[256];
+            for (int base = 0; base < I; base += (int)traits->block_values) {
+                if (!coli_dtype_dequantize_row(w->dtype, block, traits->block_values, decoded)) {
+                    sum = NAN;
+                    break;
+                }
+                for (uint32_t i = 0; i < traits->block_values; ++i) {
+                    const float v = decoded[i];
+                    if (v == 0.0f || fabsf(v) >= threshold)
+                        sum += (double)xs[base + (int)i] * v;
+                }
+                block += traits->block_bytes;
+            }
+            y[(size_t)ss * O + o] = (float)sum;
+        }
+    }
+    return 1;
+}
+
+static int q35_mm_cpu_expert_s(Q35Model *m, float *y, const float *x,
+                                ColiTensor *w, int S, int I, int O,
+                                char *err, size_t cap) {
+    if (!m || m->expert_zero_threshold <= 0.0f || w->owns_data ||
+        w->storage_kind == COLI_TENSOR_STORAGE_SPARSE_TREE)
+        return q35_mm_cpu_s(y, x, w, S, I, O, err, cap);
+    return q35_mm_cpu_thresholded_s(y, x, w, S, I, O,
+                                     m->expert_zero_threshold, err, cap);
+}
+
+static int q35_mm_cpu_expert(Q35Model *m, float *y, const float *x,
+                              ColiTensor *w, int I, int O,
+                              char *err, size_t cap) {
+    return q35_mm_cpu_expert_s(m, y, x, w, 1, I, O, err, cap);
+}
+
 static int q35_conv_update_cpu(Q35Model *m, Q35Layer *l,
                                 const float *input, float *output,
                                 float *state, char *err, size_t cap) {
@@ -748,6 +840,62 @@ static void q35_slot_bind(Q35Model *m, int layer, int eid, Q35ExpertSlot *s) {
     s->down = &l->down_expert[eid];
 }
 
+static int q35_tensor_clone_pruned(const ColiTensor *src, float threshold,
+                                    ColiTensor *dst, uint64_t *changed,
+                                    char *err, size_t cap) {
+    if (changed) *changed = 0;
+    if (!src || !src->data || !dst || threshold <= 0.0f)
+        return q35_errf(err, cap, "invalid Q35 pruned tensor clone");
+    uint8_t *copy = (uint8_t *)malloc((size_t)src->storage_bytes);
+    if (!copy) return q35_errf(err, cap, "Q35 expert pruning copy OOM");
+    memcpy(copy, src->data, (size_t)src->storage_bytes);
+    uint64_t local_changed = 0;
+    if (!coli_dtype_zero_below_inplace(src->dtype, copy, src->element_count,
+                                       threshold, &local_changed)) {
+        free(copy);
+        return q35_errf(err, cap,
+            "Q35 expert pruning unsupported for dtype %s",
+            coli_dtype_traits(src->dtype) ? coli_dtype_traits(src->dtype)->name : "unknown");
+    }
+    *dst = *src;
+    dst->data = copy;
+    dst->source_offset = 0;
+    dst->cuda = NULL;
+    dst->cuda_device = 0;
+    dst->owns_data = 1;
+    dst->mmap_backed = 0;
+    dst->owns_cuda = 0;
+    if (changed) *changed = local_changed;
+    return 1;
+}
+
+static int q35_slot_materialize_pruned(Q35Model *m, Q35ExpertSlot *s,
+                                        char *err, size_t cap) {
+    uint64_t cg = 0, cu = 0, cd = 0;
+    ColiTensor *gate = (ColiTensor *)calloc(1, sizeof(*gate));
+    ColiTensor *up = (ColiTensor *)calloc(1, sizeof(*up));
+    ColiTensor *down = (ColiTensor *)calloc(1, sizeof(*down));
+    if (!gate || !up || !down) {
+        free(gate); free(up); free(down);
+        return q35_errf(err, cap, "Q35 expert pruning descriptor OOM");
+    }
+    if (!q35_tensor_clone_pruned(s->gate, m->expert_zero_threshold, gate, &cg, err, cap) ||
+        !q35_tensor_clone_pruned(s->up, m->expert_zero_threshold, up, &cu, err, cap) ||
+        !q35_tensor_clone_pruned(s->down, m->expert_zero_threshold, down, &cd, err, cap)) {
+        coli_tensor_destroy(gate); coli_tensor_destroy(up); coli_tensor_destroy(down);
+        free(gate); free(up); free(down);
+        return 0;
+    }
+    s->gate = gate;
+    s->up = up;
+    s->down = down;
+    s->owns_pruned = 1;
+    ++m->expert_prune_materializations;
+    m->expert_prune_values_seen += gate->element_count + up->element_count + down->element_count;
+    m->expert_prune_values_zeroed += cg + cu + cd;
+    return 1;
+}
+
 static int q35_storage_load(void *ctx, int layer, int eid, void *slot, int demand) {
     Q35Model *m = (Q35Model *)ctx;
     Q35ExpertSlot *s = (Q35ExpertSlot *)slot;
@@ -759,8 +907,17 @@ static int q35_storage_load(void *ctx, int layer, int eid, void *slot, int deman
 #ifdef COLI_CUDA
     if (m->exec.kind == COLI_BACKEND_CUDA) {
         if (m->cuda_expert_admission_disabled) {
-            s->eid = -1; s->gate = s->up = s->down = NULL;
+            q35_slot_clear(s);
             return 0;
+        }
+        if (m->expert_zero_threshold > 0.0f &&
+            s->gate->storage_kind != COLI_TENSOR_STORAGE_SPARSE_TREE) {
+            char prune_err[256];
+            if (!q35_slot_materialize_pruned(m, s, prune_err, sizeof(prune_err))) {
+                fprintf(stderr, "[Q35-PRUNE] %s\n", prune_err);
+                q35_slot_clear(s);
+                return 0;
+            }
         }
         if (!coli_tensor_reside(&m->exec, s->gate) ||
             !coli_tensor_reside(&m->exec, s->up) ||
@@ -768,7 +925,7 @@ static int q35_storage_load(void *ctx, int layer, int eid, void *slot, int deman
             coli_tensor_release_backend(&m->exec, s->gate);
             coli_tensor_release_backend(&m->exec, s->up);
             coli_tensor_release_backend(&m->exec, s->down);
-            s->eid = -1; s->gate = s->up = s->down = NULL;
+            q35_slot_clear(s);
             m->cuda_expert_admission_disabled = 1;
             ++m->cuda_expert_residency_failures;
             if (!m->cuda_expert_failure_reported) {
@@ -798,7 +955,7 @@ static void q35_storage_evict(void *ctx, int layer, void *slot) {
         m->cuda_weight_bytes = m->cuda_dense_bytes + m->cuda_expert_bytes;
     }
 #endif
-    s->eid = -1; s->gate = s->up = s->down = NULL; s->used = 0;
+    q35_slot_clear(s);
 }
 
 static size_t q35_storage_bytes(void *ctx, int layer, const void *slot) {
@@ -1508,12 +1665,12 @@ static int q35_moe_cpu(Q35Model *m, Q35Scratch *s, Q35Layer *L,
         const int e = s->top_idx[j];
         Q35ExpertSlot *slot = q35_expert_acquire(m, layer, e, 1);
         if (!slot) return q35_errf(err, cap, "Q35 expert admission failed at layer %d expert %d", layer, e);
-        if (!q35_mm_cpu(s->gate, input, slot->gate, m->hidden, m->expert_ff, err, cap) ||
-            !q35_mm_cpu(s->up, input, slot->up, m->hidden, m->expert_ff, err, cap)) return 0;
+        if (!q35_mm_cpu_expert(m, s->gate, input, slot->gate, m->hidden, m->expert_ff, err, cap) ||
+            !q35_mm_cpu_expert(m, s->up, input, slot->up, m->hidden, m->expert_ff, err, cap)) return 0;
         for (int i = 0; i < m->expert_ff; ++i)
             s->gate[i] = coli_f32_silu(s->gate[i]) * s->up[i];
-        if (!q35_mm_cpu(s->expert_out, s->gate, slot->down,
-                         m->expert_ff, m->hidden, err, cap)) return 0;
+        if (!q35_mm_cpu_expert(m, s->expert_out, s->gate, slot->down,
+                                m->expert_ff, m->hidden, err, cap)) return 0;
         for (int i = 0; i < m->hidden; ++i)
             out[i] += s->top_w[j] * s->expert_out[i];
     }
@@ -1586,13 +1743,13 @@ static int q35_moe_batch_cpu(Q35Model *m, Q35Scratch *s, Q35Layer *L,
             }
         }
         if (!slot || n < 1) continue;
-        if (!q35_mm_cpu_s(s->vgate, s->vexpert_in, slot->gate, n, H, F, err, cap) ||
-            !q35_mm_cpu_s(s->vup, s->vexpert_in, slot->up, n, H, F, err, cap)) return 0;
+        if (!q35_mm_cpu_expert_s(m, s->vgate, s->vexpert_in, slot->gate, n, H, F, err, cap) ||
+            !q35_mm_cpu_expert_s(m, s->vup, s->vexpert_in, slot->up, n, H, F, err, cap)) return 0;
         for (int r = 0; r < n; ++r)
             for (int i = 0; i < F; ++i)
                 s->vgate[(size_t)r * F + i] = coli_f32_silu(s->vgate[(size_t)r * F + i]) *
                                                s->vup[(size_t)r * F + i];
-        if (!q35_mm_cpu_s(s->vexpert_out, s->vgate, slot->down, n, F, H, err, cap)) return 0;
+        if (!q35_mm_cpu_expert_s(m, s->vexpert_out, s->vgate, slot->down, n, F, H, err, cap)) return 0;
         for (int r = 0; r < n; ++r) {
             float *dst = out + (size_t)rows[r] * H;
             const float *src = s->vexpert_out + (size_t)r * H;
@@ -1953,6 +2110,9 @@ static int q35_expert_group_device(Q35Model *m, Q35Scratch *s,
     for (int i = 0; i < count; ++i) {
         Q35ExpertSlot *q = slots[i];
         if (!q || !q->gate || !q->up || !q->down ||
+            q->gate->storage_kind == COLI_TENSOR_STORAGE_SPARSE_TREE ||
+            q->up->storage_kind == COLI_TENSOR_STORAGE_SPARSE_TREE ||
+            q->down->storage_kind == COLI_TENSOR_STORAGE_SPARSE_TREE ||
             !q->gate->cuda || !q->up->cuda || !q->down->cuda) return 0;
         g[i] = q->gate->cuda; u[i] = q->up->cuda; d[i] = q->down->cuda;
     }
@@ -1990,12 +2150,12 @@ static int q35_expert_cpu_accumulate(Q35Model *m, Q35Scratch *s,
     coli_tensor_prefetch_host(gate);
     coli_tensor_prefetch_host(up);
     coli_tensor_prefetch_host(down);
-    if (!q35_mm_cpu(s->gate, s->post, gate, m->hidden, m->expert_ff, err, cap) ||
-        !q35_mm_cpu(s->up, s->post, up, m->hidden, m->expert_ff, err, cap)) return 0;
+    if (!q35_mm_cpu_expert(m, s->gate, s->post, gate, m->hidden, m->expert_ff, err, cap) ||
+        !q35_mm_cpu_expert(m, s->up, s->post, up, m->hidden, m->expert_ff, err, cap)) return 0;
     for (int i = 0; i < m->expert_ff; ++i)
         s->gate[i] = coli_f32_silu(s->gate[i]) * s->up[i];
-    if (!q35_mm_cpu(s->expert_out, s->gate, down,
-                     m->expert_ff, m->hidden, err, cap)) return 0;
+    if (!q35_mm_cpu_expert(m, s->expert_out, s->gate, down,
+                            m->expert_ff, m->hidden, err, cap)) return 0;
     for (int i = 0; i < m->hidden; ++i) s->moe[i] += weight * s->expert_out[i];
     ++m->cuda_expert_cpu_fallbacks;
     return 1;
@@ -2610,13 +2770,36 @@ static int q35_argmax(const float *x, int n) {
     return best;
 }
 
+static int q35_parse_expert_zero_threshold(Q35Model *m, char *err, size_t cap) {
+    const char *text = getenv("Q35_EXPERT_ZERO_THRESHOLD");
+    if (!text || !*text) {
+        m->expert_zero_threshold = 0.0f;
+        return 1;
+    }
+    errno = 0;
+    char *end = NULL;
+    const double value = strtod(text, &end);
+    if (errno || end == text || *end || !isfinite(value) || value < 0.0 || value > 1e6)
+        return q35_errf(err, cap,
+            "invalid Q35_EXPERT_ZERO_THRESHOLD='%s' (expected a finite number >= 0)", text);
+    m->expert_zero_threshold = (float)value;
+    return 1;
+}
+
 static int q35_load_model(Q35Model *m, const char *path, int context, int verbose,
                            int mtp_draft_max, ColiExec exec, char *err, size_t cap) {
     memset(m, 0, sizeof(*m));
     m->gguf.fd = -1; m->verbose = verbose; m->exec = exec;
     m->cuda_requested = exec.kind == COLI_BACKEND_CUDA;
+    if (!q35_parse_expert_zero_threshold(m, err, cap)) return 0;
     if (!coli_gguf_open(&m->gguf, path))
-        return q35_errf(err, cap, "cannot open GGUF: %s", coli_gguf_error(&m->gguf));
+        return q35_errf(err, cap, "cannot open model container: %s", coli_gguf_error(&m->gguf));
+    if (m->gguf.container_kind == COLI_MODEL_CONTAINER_SGGUF &&
+        m->expert_zero_threshold > 0.0f) {
+        if (verbose) fprintf(stderr,
+            "[SGGUF] Q35_EXPERT_ZERO_THRESHOLD is ignored: sparse pruning is encoded in the file\n");
+        m->expert_zero_threshold = 0.0f;
+    }
     if (!q35_model_config(m, err, cap)) return 0;
     if (mtp_draft_max < 0 || mtp_draft_max > 8)
         return q35_errf(err, cap, "--mtp-draft must be between 0 and 8");
@@ -2656,19 +2839,27 @@ static int q35_load_model(Q35Model *m, const char *path, int context, int verbos
         fprintf(stderr, "[USAGE] Q35 expert history: %lld selections\n", (long long)history);
     if (!q35_scheduler_init(m, err, cap)) return 0;
 
-    if (verbose) {
+    if (verbose && m->expert_zero_threshold > 0.0f) {
         fprintf(stderr,
-            "[GGUF] qwen35moe: trunk=%d (%d DeltaNet + %d attention) mtp=%d/%s hidden=%d heads=%d/%d experts=%d top=%d vocab=%d\n",
-            m->n_layers, m->n_recurrent, m->n_attention, m->n_mtp_layers,
+            "[Q35-PRUNE] enabled: abs(weight) < %.9g becomes exact zero for routed experts only; set Q35_EXPERT_ZERO_THRESHOLD=0 to disable\n",
+            m->expert_zero_threshold);
+    }
+
+    if (verbose) {
+        const char *container_name =
+            m->gguf.container_kind == COLI_MODEL_CONTAINER_SGGUF ? "SGGUF" : "GGUF";
+        fprintf(stderr,
+            "[%s] qwen35moe: trunk=%d (%d DeltaNet + %d attention) mtp=%d/%s hidden=%d heads=%d/%d experts=%d top=%d vocab=%d\n",
+            container_name, m->n_layers, m->n_recurrent, m->n_attention, m->n_mtp_layers,
             m->mtp_enabled ? "enabled" : "off", m->hidden,
             m->n_heads, m->n_kv_heads, m->n_experts, m->n_expert_used, m->vocab);
         if (m->exec.kind == COLI_BACKEND_CUDA)
             fprintf(stderr,
-                "[GGUF] mapped %.2fs; dense residency %.2fs, %.2f MiB before expert cache; backend=cuda (Qwen3.5-MoE + Colibri scheduler); context=%d; token_embedding=row-streamed\n",
-                mapped, q35_now_sec() - t1, m->cuda_dense_bytes / (1024.0 * 1024.0), context);
+                "[%s] mapped %.2fs; dense residency %.2fs, %.2f MiB before expert cache; backend=cuda (Qwen3.5-MoE + Colibri scheduler); context=%d; token_embedding=row-streamed\n",
+                container_name, mapped, q35_now_sec() - t1, m->cuda_dense_bytes / (1024.0 * 1024.0), context);
         else
-            fprintf(stderr, "[GGUF] mapped %.2fs; backend=cpu%s; context=%d; threads=%d\n",
-                    mapped, m->cuda_fell_back_to_cpu ? " (automatic CUDA VRAM fallback)" : " reference",
+            fprintf(stderr, "[%s] mapped %.2fs; backend=cpu%s; context=%d; threads=%d\n",
+                    container_name, mapped, m->cuda_fell_back_to_cpu ? " (automatic CUDA VRAM fallback)" : " reference",
                     context, omp_get_max_threads());
     }
     return 1;
@@ -2687,7 +2878,7 @@ static int q35_emit_token(Q35Model *m, int token) {
 
 static void q35_usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [--gguf] MODEL.gguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--mtp-draft 0..8] [--no-mtp] [--raw-prompt] [--verbose]\n",
+        "Usage: %s [--gguf] MODEL.gguf|MODEL.sgguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--mtp-draft 0..8] [--no-mtp] [--raw-prompt] [--verbose]\n",
         prog);
 }
 
@@ -3004,6 +3195,17 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
                 (unsigned long long)m.focus_group_experts,
                 (unsigned long long)m.focus_group_failures);
 #endif
+        if (m.expert_zero_threshold > 0.0f) {
+            const double pct = m.expert_prune_values_seen ?
+                100.0 * (double)m.expert_prune_values_zeroed /
+                    (double)m.expert_prune_values_seen : 0.0;
+            fprintf(stderr,
+                "[Q35-PRUNE] threshold=%.9g CUDA_materializations=%llu values_zeroed=%llu/%llu (%.3f%%); CPU fallbacks apply the same threshold during matmul\n",
+                m.expert_zero_threshold,
+                (unsigned long long)m.expert_prune_materializations,
+                (unsigned long long)m.expert_prune_values_zeroed,
+                (unsigned long long)m.expert_prune_values_seen, pct);
+        }
     }
     q35_usage_save(&m); q35_scratch_free(&s); q35_model_free(&m); free(ids);
 #ifdef COLI_CUDA

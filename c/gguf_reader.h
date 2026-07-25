@@ -11,6 +11,11 @@ extern "C" {
 #define COLI_GGUF_DEFAULT_ALIGNMENT 32u
 #define COLI_GGUF_MAX_DIMS 8u
 
+#define COLI_MODEL_CONTAINER_GGUF 0u
+#define COLI_MODEL_CONTAINER_SGGUF 1u
+#define COLI_TENSOR_STORAGE_DENSE 0u
+#define COLI_TENSOR_STORAGE_SPARSE_TREE 1u
+
 typedef enum {
     COLI_GGUF_TYPE_UINT8   = 0,
     COLI_GGUF_TYPE_INT8    = 1,
@@ -40,9 +45,20 @@ typedef struct {
     char *name;
     uint32_t n_dims;
     uint64_t dims[COLI_GGUF_MAX_DIMS];
-    uint32_t type;
+    uint32_t type;                 /* logical/base GGML type */
+    uint32_t storage_kind;         /* dense GGUF bytes or sparse tree */
+    uint32_t codec_id;             /* sparse retained-value codec */
+    uint32_t flags;
     uint64_t offset;
     uint64_t absolute_offset;
+    uint64_t payload_size;
+    uint64_t index_offset;
+    uint64_t index_absolute_offset;
+    uint64_t index_size;
+    int32_t moe_layer;
+    uint32_t moe_projection;
+    uint32_t expert_count;
+    uint32_t rows_per_expert;
 } ColiGgufTensorInfo;
 
 typedef struct {
@@ -53,6 +69,7 @@ typedef struct {
     uint64_t tensor_count;
     uint64_t metadata_count;
     uint32_t alignment;
+    uint32_t container_kind;
     uint64_t data_offset;
     ColiGgufKV *metadata;
     ColiGgufTensorInfo *tensors;
@@ -62,6 +79,8 @@ typedef struct {
     char error[256];
 } ColiGgufFile;
 
+/* Opens either a standard GGUF or an SGGUF container. The historical name is
+ * retained so existing model loaders remain source-compatible. */
 int coli_gguf_open(ColiGgufFile *g, const char *path);
 void coli_gguf_close(ColiGgufFile *g);
 
@@ -71,6 +90,11 @@ const char *coli_ggml_type_name(uint32_t type);
 
 const ColiGgufKV *coli_gguf_find_kv(const ColiGgufFile *g, const char *key);
 const ColiGgufTensorInfo *coli_gguf_find_tensor(const ColiGgufFile *g, const char *name);
+/* Storage-neutral routed-MoE lookup. SGGUF uses its explicit tensor-directory
+ * index; ordinary GGUF falls back to canonical tensor names. */
+const ColiGgufTensorInfo *coli_gguf_find_moe_tensor(const ColiGgufFile *g,
+                                                    int32_t layer,
+                                                    uint32_t projection);
 
 int coli_gguf_kv_read_u64(const ColiGgufFile *g, const ColiGgufKV *kv, uint64_t *out);
 int coli_gguf_kv_read_i64(const ColiGgufFile *g, const ColiGgufKV *kv, int64_t *out);

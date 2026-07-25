@@ -60,6 +60,12 @@ typedef int            (*fn_ggml_matmul)(float *y, const float *x, const void *w
                                          int S, int I, int O, int device);
 typedef int            (*fn_tensor_upload_ggml)(ColiCudaTensor **tensor,const void *weights,
                                          uint32_t dtype,uint64_t weight_bytes,int I,int O,int device);
+typedef int            (*fn_tensor_upload_sgguf)(ColiCudaTensor **tensor,
+                                         const uint8_t *block_offsets_le,const uint8_t *blocks,
+                                         uint64_t first_block,uint64_t block_count,uint32_t codec_id,
+                                         uint32_t sparse_layout,uint32_t offset_width,
+                                         uint16_t auxiliary_bytes_per_block,uint16_t retained_value_bits,
+                                         int I,int O,int device);
 typedef int            (*fn_tensor_view_rows)(ColiCudaTensor *base,uint64_t first_row,
                                          uint64_t row_count,ColiCudaTensor **view);
 typedef const void *   (*fn_tensor_data)(const ColiCudaTensor *tensor);
@@ -142,6 +148,7 @@ static struct {
     fn_matmul          matmul;
     fn_ggml_matmul     ggml_matmul;
     fn_tensor_upload_ggml tensor_upload_ggml;
+    fn_tensor_upload_sgguf tensor_upload_sgguf;
     fn_tensor_view_rows tensor_view_rows;
     fn_tensor_data tensor_data;
     fn_tensor_matmul_host tensor_matmul_host;
@@ -261,6 +268,7 @@ static int coli_cuda_load(void){
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(ggml_matmul,    fn_ggml_matmul)
     RESOLVE(tensor_upload_ggml, fn_tensor_upload_ggml)
+    RESOLVE(tensor_upload_sgguf, fn_tensor_upload_sgguf)
     RESOLVE(tensor_view_rows, fn_tensor_view_rows)
     RESOLVE(tensor_data, fn_tensor_data)
     RESOLVE(tensor_matmul_host, fn_tensor_matmul_host)
@@ -450,6 +458,16 @@ int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_d
 int coli_cuda_tensor_upload_ggml(ColiCudaTensor **tensor,const void *weights,uint32_t dtype,
         uint64_t weight_bytes,int I,int O,int device){
     if(!g_cuda.available)return 0;return g_cuda.tensor_upload_ggml(tensor,weights,dtype,weight_bytes,I,O,device);
+}
+int coli_cuda_tensor_upload_sgguf(ColiCudaTensor **tensor,const uint8_t *block_offsets_le,
+        const uint8_t *blocks,uint64_t first_block,uint64_t block_count,uint32_t codec_id,
+        uint32_t sparse_layout,uint32_t offset_width,
+        uint16_t auxiliary_bytes_per_block,uint16_t retained_value_bits,
+        int I,int O,int device){
+    if(!g_cuda.available)return 0;
+    return g_cuda.tensor_upload_sgguf(tensor,block_offsets_le,blocks,first_block,block_count,
+                                      codec_id,sparse_layout,offset_width,
+                                      auxiliary_bytes_per_block,retained_value_bits,I,O,device);
 }
 int coli_cuda_tensor_view_rows(ColiCudaTensor *base,uint64_t first_row,uint64_t row_count,ColiCudaTensor **view){
     if(!g_cuda.available)return 0;return g_cuda.tensor_view_rows(base,first_row,row_count,view);

@@ -71,3 +71,6 @@ c/olmoe_i4/
 
 # generated GGUF tools
 c/gguf-inspect
+
+/obsolete/
+/zip_clean.sh

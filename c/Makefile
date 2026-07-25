@@ -174,9 +174,9 @@ ifneq ($(IS_WIN),)
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Wno-deprecated-gpu-targets -Xcompiler=-W3
 else
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Wno-deprecated-gpu-targets -Xcompiler=-Wall,-Wextra
 endif
 # HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
@@ -204,6 +204,7 @@ endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_gguf_reader$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
 TEST_BINS += tests/test_ggml_types$(EXE) tests/test_ggml_quants$(EXE) tests/test_tensor$(EXE) tests/test_expert_scheduler$(EXE) tests/test_f32_kernels$(EXE) tests/test_gguf_tokenizer$(EXE) tests/test_gguf_granite$(EXE) tests/test_gguf_qwen3next$(EXE) tests/test_gguf_qwen35moe$(EXE)
+TEST_BINS += tests/test_sgguf$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -259,13 +260,16 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-GGUF_RUNTIME_SRC = gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c
-GGUF_RUNTIME_HDR = gguf_granite.h gguf_qwen3next.h gguf_qwen35moe.h gguf_tokenizer.h tensor.h expert_scheduler.h ggml_quants.h ggml_types.h gguf_reader.h f32_kernels.h
+GGUF_RUNTIME_SRC = gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c
+GGUF_RUNTIME_HDR = gguf_granite.h gguf_qwen3next.h gguf_qwen35moe.h gguf_tokenizer.h tensor.h expert_scheduler.h ggml_quants.h ggml_types.h gguf_reader.h sgguf.h f32_kernels.h
 
 all: colibri$(EXE)
 
-# phony targets — 'glm' kept for backward compatibility
+# phony targets — 'glm' kept for backward compatibility. On POSIX EXE is
+# empty, so declaring `colibri: colibri` creates a circular dependency.
+ifneq ($(EXE),)
 colibri: colibri$(EXE)
+endif
 glm: colibri$(EXE)
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
@@ -307,14 +311,14 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu backend_cuda.h
+cuda-dll: backend_cuda.cu backend_cuda.h sgguf.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h sgguf.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -325,10 +329,14 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h sgguf.h tests/test_backend_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
-	./backend_cuda_test$(EXE)
+
+cuda-sgguf-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h sgguf.h tests/test_sgguf_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_sgguf_cuda.cu -o sgguf_cuda_test$(EXE)
+	./sgguf_cuda_test$(EXE)
 
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
@@ -369,11 +377,20 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
-gguf-inspect$(EXE): gguf_inspect.c gguf_reader.c gguf_reader.h compat.h
-	$(CC) $(CFLAGS) gguf_inspect.c gguf_reader.c -o gguf-inspect$(EXE) $(LDFLAGS)
 
-tests/test_gguf_reader$(EXE): tests/test_gguf_reader.c gguf_reader.c gguf_reader.h compat.h
-	$(CC) $(CFLAGS) tests/test_gguf_reader.c gguf_reader.c -o $@ $(LDFLAGS)
+sgguf-convert$(EXE): sgguf_convert.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h compat.h
+	$(CC) $(CFLAGS) sgguf_convert.c gguf_reader.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
+
+sgguf-inspect$(EXE): sgguf_inspect.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h compat.h
+	$(CC) $(CFLAGS) sgguf_inspect.c gguf_reader.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
+gguf-inspect$(EXE): gguf_inspect.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h sgguf.c sgguf.h ggml_quants.c ggml_quants.h compat.h
+	$(CC) $(CFLAGS) gguf_inspect.c gguf_reader.c ggml_types.c sgguf.c ggml_quants.c -o gguf-inspect$(EXE) $(LDFLAGS)
+
+tests/test_gguf_reader$(EXE): tests/test_gguf_reader.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h sgguf.c sgguf.h ggml_quants.c ggml_quants.h compat.h
+	$(CC) $(CFLAGS) tests/test_gguf_reader.c gguf_reader.c ggml_types.c sgguf.c ggml_quants.c -o $@ $(LDFLAGS)
+
+tests/test_sgguf$(EXE): tests/test_sgguf.c sgguf.c sgguf.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
+	$(CC) $(CFLAGS) tests/test_sgguf.c sgguf.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
 
 tests/test_ggml_types$(EXE): tests/test_ggml_types.c ggml_types.c ggml_types.h
 	$(CC) $(CFLAGS) tests/test_ggml_types.c ggml_types.c -o $@ $(LDFLAGS)
@@ -382,7 +399,7 @@ tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.c ggml_quants
 	$(CC) $(CFLAGS) tests/test_ggml_quants.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
 
 tests/test_tensor$(EXE): tests/test_tensor.c tensor.c tensor.h gguf_reader.c gguf_reader.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
-	$(CC) $(CFLAGS) tests/test_tensor.c tensor.c gguf_reader.c ggml_quants.c ggml_types.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_tensor.c tensor.c gguf_reader.c ggml_quants.c ggml_types.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 
 tests/test_expert_scheduler$(EXE): tests/test_expert_scheduler.c expert_scheduler.c expert_scheduler.h tier.h
@@ -391,17 +408,17 @@ tests/test_expert_scheduler$(EXE): tests/test_expert_scheduler.c expert_schedule
 tests/test_f32_kernels$(EXE): tests/test_f32_kernels.c f32_kernels.h
 	$(CC) $(CFLAGS) tests/test_f32_kernels.c -o $@ $(LDFLAGS)
 
-tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_tokenizer.h gguf_reader.c gguf_reader.h tok.h tok_unicode.h tok_unicode_o200k.h json.h
-	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c -o $@ $(LDFLAGS)
+tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_tokenizer.h gguf_reader.c gguf_reader.h ggml_types.c sgguf.c ggml_quants.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c ggml_types.c sgguf.c ggml_quants.c -o $@ $(LDFLAGS)
 
 tests/test_gguf_granite$(EXE): tests/test_gguf_granite.c gguf_granite.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_gguf_qwen3next$(EXE): tests/test_gguf_qwen3next.c gguf_qwen3next.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_qwen3next.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_qwen3next.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_gguf_qwen35moe$(EXE): tests/test_gguf_qwen35moe.c gguf_qwen35moe.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -555,4 +572,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm gguf-inspect run-f32-gguf cuda-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm gguf-inspect sgguf-convert sgguf-inspect run-f32-gguf cuda-test cuda-sgguf-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
