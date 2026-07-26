@@ -222,6 +222,15 @@ static void deq_q8_k(const uint8_t *p, float *y) {
     for (int j = 0; j < 256; ++j) y[j] = d * q[j];
 }
 
+static void deq_iq4_nl(const uint8_t *p, float *y) {
+    const float d = coli_fp16_to_fp32(load_u16(p));
+    const uint8_t *q = p + 2;
+    for (uint32_t j = 0; j < 16; ++j) {
+        y[j] = d * (float)k_iq4nl_values[q[j] & 15u];
+        y[j + 16u] = d * (float)k_iq4nl_values[q[j] >> 4];
+    }
+}
+
 static void deq_iq4_xs(const uint8_t *p, float *y) {
     const float d = coli_fp16_to_fp32(load_u16(p));
     const uint16_t scales_h = load_u16(p + 2);
@@ -275,6 +284,7 @@ int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
             case 13: deq_q5_k(p, y); break;
             case 14: deq_q6_k(p, y); break;
             case 15: deq_q8_k(p, y); break;
+            case 20: deq_iq4_nl(p, y); break;
             case 23: deq_iq4_xs(p, y); break;
             case 30:
                 y[0] = coli_bf16_to_fp32(load_u16(p));

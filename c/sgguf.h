@@ -50,6 +50,7 @@ typedef enum {
     COLI_SGGUF_CODEC_Q8_K_EXACT = 14,
     COLI_SGGUF_CODEC_MXFP4_EXACT = 15,
     COLI_SGGUF_CODEC_IQ4_XS_EXACT = 16,
+    COLI_SGGUF_CODEC_IQ4_NL_EXACT = 17,
 } ColiSggufCodecId;
 
 typedef enum {

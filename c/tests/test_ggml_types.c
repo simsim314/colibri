@@ -10,13 +10,16 @@ int main(void) {
     assert(q81 && q81->block_bytes == 36);
     const ColiGgmlTypeTraits *bf16 = coli_ggml_type_traits(30);
     assert(bf16 && !bf16->quantized && bf16->block_values == 1 && bf16->block_bytes == 2);
+    const ColiGgmlTypeTraits *iq4nl = coli_ggml_type_traits(20);
     const ColiGgmlTypeTraits *iq4xs = coli_ggml_type_traits(23);
     const ColiGgmlTypeTraits *mxfp4 = coli_ggml_type_traits(39);
+    assert(iq4nl && iq4nl->block_values == 32 && iq4nl->block_bytes == 18);
     assert(iq4xs && iq4xs->block_values == 256 && iq4xs->block_bytes == 136);
     assert(mxfp4 && mxfp4->block_values == 32 && mxfp4->block_bytes == 17);
     uint64_t n;
     assert(coli_ggml_row_size(12, 512, &n) && n == 288);
     assert(coli_ggml_row_size(30, 2048, &n) && n == 4096);
+    assert(coli_ggml_row_size(20, 2880, &n) && n == 1620);
     assert(coli_ggml_row_size(23, 512, &n) && n == 272);
     assert(coli_ggml_row_size(39, 2880, &n) && n == 1530);
     assert(!coli_ggml_row_size(12, 257, &n));

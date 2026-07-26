@@ -16,8 +16,14 @@ Implemented model details:
 - OpenAI clamped SwiGLU activation;
 - ordinary GGUF and SPB3 sparse expert tensors through the same `ColiTensor`
   interface;
-- dense IQ4_XS and MXFP4 CPU/CUDA matvec kernels;
-- sparse IQ4_XS and MXFP4 CPU/CUDA matvec kernels.
+- dense IQ4_NL, IQ4_XS, and MXFP4 CPU/CUDA matvec kernels;
+- sparse IQ4_NL, IQ4_XS, and MXFP4 CPU/CUDA matvec kernels.
+
+The currently inspected `gpt-oss-120b-Uncensored-xCloud.i1-IQ4_XS.gguf`
+uses IQ4_NL for all 108 routed expert matrices. Its remaining tensors are a
+mixture of IQ4_NL, IQ4_XS, Q5_1, Q8_0, and F32. The IQ4_NL path is therefore
+the primary GPT-OSS expert path; MXFP4 support remains available for other
+GGUF variants.
 
 The CUDA mode is a correctness-first hybrid path for small GPUs. Dense layer
 weights are made resident when possible and otherwise streamed. Selected

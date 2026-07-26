@@ -260,8 +260,8 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-GGUF_RUNTIME_SRC = gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_gptoss.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c
-GGUF_RUNTIME_HDR = gguf_granite.h gguf_qwen3next.h gguf_qwen35moe.h gguf_gptoss.h gguf_tokenizer.h tensor.h expert_scheduler.h ggml_quants.h ggml_types.h gguf_reader.h sgguf.h f32_kernels.h
+GGUF_RUNTIME_SRC = gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_gptoss.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c split_storage.c sgguf.c
+GGUF_RUNTIME_HDR = gguf_granite.h gguf_qwen3next.h gguf_qwen35moe.h gguf_gptoss.h gguf_tokenizer.h tensor.h expert_scheduler.h ggml_quants.h ggml_types.h gguf_reader.h split_storage.h sgguf.h f32_kernels.h
 
 all: colibri$(EXE)
 
@@ -378,16 +378,22 @@ iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
 
-sgguf-convert$(EXE): sgguf_convert.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h compat.h
-	$(CC) $(CFLAGS) sgguf_convert.c gguf_reader.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
+sgguf-convert$(EXE): sgguf_convert.c gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h compat.h
+	$(CC) $(CFLAGS) sgguf_convert.c gguf_reader.c split_storage.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
 
-sgguf-inspect$(EXE): sgguf_inspect.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h compat.h
-	$(CC) $(CFLAGS) sgguf_inspect.c gguf_reader.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
-gguf-inspect$(EXE): gguf_inspect.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h sgguf.c sgguf.h ggml_quants.c ggml_quants.h compat.h
-	$(CC) $(CFLAGS) gguf_inspect.c gguf_reader.c ggml_types.c sgguf.c ggml_quants.c -o gguf-inspect$(EXE) $(LDFLAGS)
+sgguf-inspect$(EXE): sgguf_inspect.c gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h compat.h
+	$(CC) $(CFLAGS) sgguf_inspect.c gguf_reader.c split_storage.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
+gguf-inspect$(EXE): gguf_inspect.c gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c ggml_types.h sgguf.c sgguf.h ggml_quants.c ggml_quants.h compat.h
+	$(CC) $(CFLAGS) gguf_inspect.c gguf_reader.c split_storage.c ggml_types.c sgguf.c ggml_quants.c -o gguf-inspect$(EXE) $(LDFLAGS)
 
-tests/test_gguf_reader$(EXE): tests/test_gguf_reader.c gguf_reader.c gguf_reader.h ggml_types.c ggml_types.h sgguf.c sgguf.h ggml_quants.c ggml_quants.h compat.h
-	$(CC) $(CFLAGS) tests/test_gguf_reader.c gguf_reader.c ggml_types.c sgguf.c ggml_quants.c -o $@ $(LDFLAGS)
+sgguf-plan$(EXE): sgguf_plan.c split_plan.c split_plan.h gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h
+	$(CC) $(CFLAGS) sgguf_plan.c split_plan.c gguf_reader.c split_storage.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
+
+sgguf-split$(EXE): sgguf_split.c split_plan.c split_plan.h gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c ggml_types.h ggml_quants.c ggml_quants.h sgguf.c sgguf.h
+	$(CC) $(CFLAGS) sgguf_split.c split_plan.c gguf_reader.c split_storage.c ggml_types.c ggml_quants.c sgguf.c -o $@ $(LDFLAGS)
+
+tests/test_gguf_reader$(EXE): tests/test_gguf_reader.c gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c ggml_types.h sgguf.c sgguf.h ggml_quants.c ggml_quants.h compat.h
+	$(CC) $(CFLAGS) tests/test_gguf_reader.c gguf_reader.c split_storage.c ggml_types.c sgguf.c ggml_quants.c -o $@ $(LDFLAGS)
 
 tests/test_sgguf$(EXE): tests/test_sgguf.c sgguf.c sgguf.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
 	$(CC) $(CFLAGS) tests/test_sgguf.c sgguf.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
@@ -398,8 +404,8 @@ tests/test_ggml_types$(EXE): tests/test_ggml_types.c ggml_types.c ggml_types.h
 tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
 	$(CC) $(CFLAGS) tests/test_ggml_quants.c ggml_quants.c ggml_types.c -o $@ $(LDFLAGS)
 
-tests/test_tensor$(EXE): tests/test_tensor.c tensor.c tensor.h gguf_reader.c gguf_reader.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
-	$(CC) $(CFLAGS) tests/test_tensor.c tensor.c gguf_reader.c ggml_quants.c ggml_types.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+tests/test_tensor$(EXE): tests/test_tensor.c tensor.c tensor.h gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_quants.c ggml_quants.h ggml_types.c ggml_types.h
+	$(CC) $(CFLAGS) tests/test_tensor.c tensor.c gguf_reader.c split_storage.c ggml_quants.c ggml_types.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 
 tests/test_expert_scheduler$(EXE): tests/test_expert_scheduler.c expert_scheduler.c expert_scheduler.h tier.h
@@ -408,20 +414,20 @@ tests/test_expert_scheduler$(EXE): tests/test_expert_scheduler.c expert_schedule
 tests/test_f32_kernels$(EXE): tests/test_f32_kernels.c f32_kernels.h
 	$(CC) $(CFLAGS) tests/test_f32_kernels.c -o $@ $(LDFLAGS)
 
-tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_tokenizer.h gguf_reader.c gguf_reader.h ggml_types.c sgguf.c ggml_quants.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
-	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c ggml_types.c sgguf.c ggml_quants.c -o $@ $(LDFLAGS)
+tests/test_gguf_tokenizer$(EXE): tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_tokenizer.h gguf_reader.c split_storage.c gguf_reader.h split_storage.h ggml_types.c sgguf.c ggml_quants.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
+	$(CC) $(CFLAGS) tests/test_gguf_tokenizer.c gguf_tokenizer.c gguf_reader.c split_storage.c ggml_types.c sgguf.c ggml_quants.c -o $@ $(LDFLAGS)
 
 tests/test_gguf_granite$(EXE): tests/test_gguf_granite.c gguf_granite.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_gptoss.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_granite.c gguf_qwen3next.c gguf_qwen35moe.c gguf_gptoss.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c split_storage.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_gguf_qwen3next$(EXE): tests/test_gguf_qwen3next.c gguf_qwen3next.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_qwen3next.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_qwen3next.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c split_storage.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_gguf_qwen35moe$(EXE): tests/test_gguf_qwen35moe.c gguf_qwen35moe.c $(GGUF_RUNTIME_SRC) $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_gguf_qwen35moe.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c split_storage.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_gguf_gptoss$(EXE): tests/test_gguf_gptoss.c gguf_gptoss.c $(GGUF_RUNTIME_HDR)
-	$(CC) $(CFLAGS) tests/test_gguf_gptoss.c gguf_tokenizer.c tensor.c ggml_quants.c ggml_types.c gguf_reader.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
+tests/test_gguf_gptoss$(EXE): tests/test_gguf_gptoss.c gguf_gptoss.c expert_scheduler.c $(GGUF_RUNTIME_HDR)
+	$(CC) $(CFLAGS) tests/test_gguf_gptoss.c gguf_tokenizer.c tensor.c expert_scheduler.c ggml_quants.c ggml_types.c gguf_reader.c split_storage.c sgguf.c $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -575,4 +581,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm gguf-inspect sgguf-convert sgguf-inspect run-f32-gguf cuda-test cuda-sgguf-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all colibri glm gguf-inspect sgguf-convert sgguf-inspect sgguf-plan sgguf-split run-f32-gguf cuda-test cuda-sgguf-test hip-test gpu-compile cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench

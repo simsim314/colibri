@@ -31,10 +31,13 @@ retained values whenever an exact codec exists:
 ```text
 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q8_1
 Q3_K Q4_K Q5_K Q6_K Q8_K
-IQ4_XS MXFP4
+IQ4_NL IQ4_XS MXFP4
 F16 BF16 F32 retained-value streams
 ```
 
+For IQ4_NL, each 256-value group stores the eight original FP16 block scales
+plus retained nonlinear four-bit codes. The 64-value tail in a 2880-wide
+GPT-OSS row uses the first two scale slots and leaves the other six zero.
 For GPT-OSS MXFP4, each 256-value group stores eight original E8M0 scale bytes
 plus retained four-bit E2M1 codes. For IQ4_XS, each group stores the original
 FP16 super-scale and packed subgroup scales plus retained nonlinear four-bit
@@ -76,7 +79,7 @@ Use the same model argument for GGUF and SGGUF:
 
 CPU kernels enumerate bitmap set bits. CUDA uploads the selected compressed
 block range plus its normalized offset table and decodes retained codes inside
-the sparse matvec kernel. Dense GGUF IQ4_XS and MXFP4 tensors use the ordinary
+the sparse matvec kernel. Dense GGUF IQ4_NL, IQ4_XS, and MXFP4 tensors use the ordinary
 dense quantized matvec path.
 
 ## Format limit

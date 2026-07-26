@@ -2794,6 +2794,7 @@ static int q35_load_model(Q35Model *m, const char *path, int context, int verbos
     if (!q35_parse_expert_zero_threshold(m, err, cap)) return 0;
     if (!coli_gguf_open(&m->gguf, path))
         return q35_errf(err, cap, "cannot open model container: %s", coli_gguf_error(&m->gguf));
+    coli_gguf_set_preload_backend(&m->gguf, exec.kind, exec.device);
     if (m->gguf.container_kind == COLI_MODEL_CONTAINER_SGGUF &&
         m->expert_zero_threshold > 0.0f) {
         if (verbose) fprintf(stderr,

@@ -1,5 +1,6 @@
 #include "gguf_reader.h"
 #include "sgguf.h"
+#include "split_storage.h"
 #include "ggml_types.h"
 #include "compat.h"
 
@@ -79,15 +80,41 @@ static uint64_t load_u64_le(const unsigned char p[8]) {
 
 const void *coli_gguf_mapped_at(const ColiGgufFile *g, uint64_t offset, uint64_t bytes) {
     uint64_t end;
-    if (!g || !g->mapping || add_overflow_u64(offset, bytes, &end) ||
-        end > g->mapping_size || offset > SIZE_MAX) return NULL;
+    if (!g || add_overflow_u64(offset, bytes, &end) || end > g->file_size || offset > SIZE_MAX)
+        return NULL;
+    if (g->split) {
+        int handled = 0, mmap_backed = 1;
+        const void *p = coli_split_mapped_at(g->split, g->mapping, g->mapping_size,
+                                             offset, bytes, &handled, &mmap_backed,
+                                             ((ColiGgufFile *)g)->error,
+                                             sizeof(g->error));
+        if (handled) return p;
+    }
+    if (!g->mapping || end > g->mapping_size) return NULL;
     return (const unsigned char *)g->mapping + (size_t)offset;
+}
+
+int coli_gguf_range_is_mmap_backed(const ColiGgufFile *g, uint64_t offset, uint64_t bytes) {
+    if (!g || !g->split) return 1;
+    int handled = 0, mmap_backed = 1;
+    (void)coli_split_mapped_at(g->split, g->mapping, g->mapping_size,
+                               offset, bytes, &handled, &mmap_backed,
+                               NULL, 0);
+    return handled ? mmap_backed : 1;
+}
+
+void coli_gguf_drop_source_pages(const ColiGgufFile *g, uint64_t offset, uint64_t bytes) {
+    if (g && g->split) coli_split_drop_source_pages(g->split, offset, bytes);
 }
 
 int coli_gguf_read_at(const ColiGgufFile *g, uint64_t offset, void *dst, size_t bytes) {
     uint64_t end;
     if (!g || g->fd < 0 || (!dst && bytes)) return 0;
     if (add_overflow_u64(offset, (uint64_t)bytes, &end) || end > g->file_size) return 0;
+    if (g->split) {
+        return coli_split_read_at(g->split, g->fd, g->mapping, g->mapping_size,
+                                  g->file_size, offset, dst, bytes);
+    }
     const void *mapped = coli_gguf_mapped_at(g, offset, (uint64_t)bytes);
     if (mapped) {
         if (bytes) memcpy(dst, mapped, bytes);
@@ -494,10 +521,14 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
         gguf_fail(g, "cannot stat '%s': %s", path, strerror(errno));
         goto fail;
     }
-    g->file_size = (uint64_t)st.st_size;
+    g->physical_file_size = (uint64_t)st.st_size;
+    g->file_size = g->physical_file_size;
+    if (!coli_split_open_primary(g->fd, path, g->physical_file_size,
+                                 &g->split, &g->file_size,
+                                 g->error, sizeof(g->error))) goto fail;
 
-    /* Map the file without copying it. The mapping reserves virtual address
-     * space only; physical pages are faulted from disk as kernels touch them. */
+    /* Map only the logical model range. Split primaries append their manifest
+     * after this sparse GGUF image. Physical pages are faulted on demand. */
     if (g->file_size && g->file_size <= SIZE_MAX) {
 #ifdef _WIN32
         intptr_t osfh = _get_osfhandle(g->fd);
@@ -591,6 +622,7 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
         if (!cursor_u32(&c, &t->type)) goto fail;
         t->storage_kind = COLI_TENSOR_STORAGE_DENSE;
         t->moe_layer = -1;
+        t->split_location = COLI_SPLIT_FAST_MMAP;
         if (g->container_kind == COLI_MODEL_CONTAINER_GGUF) {
             if (!cursor_u64(&c, &t->offset)) goto fail;
         } else {
@@ -688,6 +720,22 @@ int coli_gguf_open(ColiGgufFile *g, const char *path) {
         }
     }
 
+    if (g->split) {
+        for (uint64_t i = 0; i < g->tensor_count; ++i) {
+            ColiGgufTensorInfo *t = &g->tensors[i];
+            uint32_t location = COLI_SPLIT_FRAGMENTED;
+            uint64_t shard_offset = 0;
+            if (!coli_split_validate_tensor(g->split, i, t->absolute_offset,
+                                            t->payload_size, &location,
+                                            &shard_offset)) {
+                gguf_fail(g, "split coverage mismatch for tensor '%s'", t->name);
+                goto fail;
+            }
+            t->split_location = location;
+            t->split_shard_offset = shard_offset;
+        }
+    }
+
     g->error[0] = '\0';
     return 1;
 
@@ -719,10 +767,22 @@ void coli_gguf_close(ColiGgufFile *g) {
 #endif
     }
     if (g->fd >= 0) close(g->fd);
+    coli_split_close(g->split);
 
     memset(g, 0, sizeof(*g));
     g->fd = -1;
     memcpy(g->error, saved_error, sizeof(g->error));
+}
+
+void coli_gguf_set_preload_backend(ColiGgufFile *g, int backend_kind, int device) {
+    if (!g) return;
+    g->preload_backend_kind = backend_kind;
+    g->preload_device = device;
+    coli_split_set_preload_backend(g->split, backend_kind);
+}
+
+int coli_gguf_is_split(const ColiGgufFile *g) {
+    return g && g->split != NULL;
 }
 
 const char *coli_gguf_error(const ColiGgufFile *g) {

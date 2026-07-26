@@ -70,6 +70,11 @@ int main(int argc, char **argv) {
     printf("tensors: %llu\n", (unsigned long long)f.tensor_count);
     printf("metadata: %llu\n", (unsigned long long)f.metadata_count);
     printf("alignment: %u\n", f.alignment);
+    if (coli_gguf_is_split(&f)) {
+        printf("split: yes\n");
+        printf("preload_shard: %s\n", coli_split_preload_path(f.split));
+        printf("tail_shard: %s\n", coli_split_tail_path(f.split));
+    }
 
     TypeStat stats[128];
     size_t stat_count = 0;
@@ -97,8 +102,9 @@ int main(int argc, char **argv) {
                    t->storage_kind == COLI_TENSOR_STORAGE_SPARSE_TREE ? "sparse" : "dense");
             for (uint32_t d = 0; d < t->n_dims; ++d)
                 printf("%s%llu", d ? "x" : "", (unsigned long long)t->dims[d]);
-            printf(" payload=%.2f MiB%s\n", t->payload_size / (1024.0 * 1024.0),
-                   is_routed_expert(t->name) ? " routed-moe" : "");
+            printf(" payload=%.2f MiB%s location=%s\n", t->payload_size / (1024.0 * 1024.0),
+                   is_routed_expert(t->name) ? " routed-moe" : "",
+                   coli_split_location_name(t->split_location));
         }
 
         if (t->storage_kind != COLI_TENSOR_STORAGE_SPARSE_TREE) {

@@ -731,6 +731,7 @@ static int argmax(const float*x,int n){int b=0;for(int i=1;i<n;i++)if(x[i]>x[b])
 static int load_model(GraniteModel*m,const char*path,int context,int verbose,ColiExec exec,char*err,size_t cap){
     memset(m,0,sizeof(*m));m->gguf.fd=-1;m->verbose=verbose;m->exec=exec;
     if(!coli_gguf_open(&m->gguf,path))return errf(err,cap,"cannot open GGUF: %s",coli_gguf_error(&m->gguf));
+    coli_gguf_set_preload_backend(&m->gguf,exec.kind,exec.device);
     if(!model_config(m,err,cap))return 0;
     if(!coli_gguf_tokenizer_load(&m->tokenizer,&m->gguf,err,cap))return 0;
     if(coli_gguf_tokenizer_vocab_size(m->tokenizer)!=m->vocab)return errf(err,cap,"tokenizer/model vocabulary mismatch");
@@ -752,7 +753,7 @@ static int load_model(GraniteModel*m,const char*path,int context,int verbose,Col
 }
 
 static void usage(const char*prog){
-    fprintf(stderr,"Usage: %s [--gguf] MODEL.gguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--raw-prompt] [--verbose]\n",prog);
+    fprintf(stderr,"Usage: %s [--gguf] MODEL.gguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--raw-prompt] [--verbose] [--debug-light]\n",prog);
 }
 int coli_gguf_cli_requested(int argc,char**argv){
     if(argc>1&&!strcmp(argv[1],"--gguf"))return 1;
@@ -767,8 +768,12 @@ int coli_gguf_run_cli(int argc,char**argv){
         if(!strcmp(argv[i],"--prompt")&&i+1<argc)prompt=argv[++i];
         else if(!strcmp(argv[i],"--max-tokens")&&i+1<argc)max_tokens=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--device")&&i+1<argc)device_arg=argv[++i];
+        else if(!strcmp(argv[i],"--usage-file")&&i+1<argc)++i; /* model-specific dispatch consumes it */
         else if(!strcmp(argv[i],"--mtp-draft")&&i+1<argc)++i; /* qwen35moe dispatch consumes it */
         else if(!strcmp(argv[i],"--no-mtp")){} /* qwen35moe dispatch consumes it */
+        else if(!strcmp(argv[i],"--debug")){} /* gpt-oss dispatch consumes --debug */
+        else if(!strcmp(argv[i],"--debug-dir")&&i+1<argc)++i; /* gpt-oss dispatch consumes --debug-dir */
+        else if(!strcmp(argv[i],"--debug-light")){} /* gpt-oss dispatch consumes --debug-light */
         else if(!strcmp(argv[i],"--raw-prompt"))raw=1;
         else if(!strcmp(argv[i],"--verbose")||!strcmp(argv[i],"-v"))verbose=1;
         else {fprintf(stderr,"unknown GGUF option: %s\n",argv[i]);usage(argv[0]);return 2;}

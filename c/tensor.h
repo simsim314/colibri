@@ -47,6 +47,7 @@ typedef struct {
     uint64_t sparse_block_count;
     ColiCudaTensor *cuda;
     int cuda_device;
+    uint32_t split_location;
     unsigned owns_data : 1;
     unsigned mmap_backed : 1;
     unsigned owns_cuda : 1;
@@ -56,6 +57,15 @@ int coli_tensor_bind_gguf(const ColiGgufFile *file,
                           const ColiGgufTensorInfo *info,
                           ColiTensor *out,
                           char *error, size_t error_size);
+
+/* Bind a contiguous dense row range directly from a GGUF tensor. This permits
+ * one routed expert to live in a different split-storage fragment from the
+ * other experts in the original [I,O,E] tensor. */
+int coli_tensor_bind_gguf_rows(const ColiGgufFile *file,
+                               const ColiGgufTensorInfo *info,
+                               uint64_t first_row, uint64_t row_count,
+                               ColiTensor *out,
+                               char *error, size_t error_size);
 
 /* Creates a non-owning 2-D row slice. Rows are the product of dimensions 1..N.
  * This is used for one expert inside GGUF [I,O,E] tensors without copying it. */

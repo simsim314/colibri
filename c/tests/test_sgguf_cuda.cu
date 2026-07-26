@@ -115,13 +115,24 @@ static int test_new_dense_types(int device){
     std::vector<float> x256(256,1.0f);
     float got=0.0f;
 
+    unsigned char iq4nl[18]={0};
+    u16(iq4nl,0x3c00u);                  /* fp16 d = 1 */
+    std::memset(iq4nl+2,0x88,16);        /* code 8 => +1 */
+    std::vector<float> x32(32,1.0f);
+    ColiCudaTensor *inl=nullptr;
+    int ok=coli_cuda_tensor_upload_ggml(&inl,iq4nl,COLI_DTYPE_IQ4_NL,sizeof(iq4nl),32,1,device)&&
+           coli_cuda_tensor_matmul_host(inl,&got,x32.data(),1)&&std::fabs(got-32.0f)<1e-4f;
+    if(!ok)std::fprintf(stderr,"dense IQ4_NL CUDA mismatch got %.9g\n",got);
+    if(inl)coli_cuda_tensor_free(inl);
+    if(!ok)return 0;
+
     unsigned char iq4xs[136]={0};
     u16(iq4xs,0x3c00u);          /* fp16 d = 1 */
     u16(iq4xs+2,0xaaaau);        /* high scale bits = 2 */
     for(int i=0;i<4;i++)iq4xs[4+i]=0x11u; /* low bits = 1 => scale 1 */
     std::memset(iq4xs+8,0x88,128);         /* IQ4_NL code 8 => +1 */
     ColiCudaTensor *iq=nullptr;
-    int ok=coli_cuda_tensor_upload_ggml(&iq,iq4xs,COLI_DTYPE_IQ4_XS,sizeof(iq4xs),256,1,device)&&
+    ok=coli_cuda_tensor_upload_ggml(&iq,iq4xs,COLI_DTYPE_IQ4_XS,sizeof(iq4xs),256,1,device)&&
            coli_cuda_tensor_matmul_host(iq,&got,x256.data(),1)&&std::fabs(got-256.0f)<1e-3f;
     if(!ok)std::fprintf(stderr,"dense IQ4_XS CUDA mismatch got %.9g\n",got);
     if(iq)coli_cuda_tensor_free(iq);
@@ -129,7 +140,7 @@ static int test_new_dense_types(int device){
 
     unsigned char mx[17]={0};mx[0]=127;
     std::memset(mx+1,0x11,16);             /* code 1 => +0.5 */
-    std::vector<float> x32(32,1.0f);got=0.0f;
+    got=0.0f;
     ColiCudaTensor *mt=nullptr;
     ok=coli_cuda_tensor_upload_ggml(&mt,mx,COLI_DTYPE_MXFP4,sizeof(mx),32,1,device)&&
        coli_cuda_tensor_matmul_host(mt,&got,x32.data(),1)&&std::fabs(got-16.0f)<1e-4f;
@@ -153,6 +164,26 @@ static int test_sparse_mxfp4_tail(int device){
                 64,1,device)&&
            coli_cuda_tensor_matmul_host(t,&got,x.data(),1)&&std::fabs(got-32.0f)<1e-4f;
     if(!ok)std::fprintf(stderr,"SPB3 MXFP4 tail CUDA mismatch got %.9g\n",got);
+    if(t)coli_cuda_tensor_free(t);
+    return ok;
+}
+
+static int test_sparse_iq4_nl_tail(int device){
+    unsigned char offsets[8]={0};
+    const unsigned block_bytes=32u+16u+32u;
+    std::vector<unsigned char> block(block_bytes,0);
+    for(unsigned i=0;i<64;i++)block[i>>3]|=(unsigned char)(1u<<(i&7u));
+    u16(block.data()+32,0x3c00u);
+    u16(block.data()+34,0x4000u);          /* second 32-value scale = 2 */
+    std::memset(block.data()+48,0x88,32);  /* all retained code 8 => +1 */
+    u32(offsets,0);u32(offsets+4,block_bytes);
+    std::vector<float> x(64,1.0f);float got=0.0f;
+    ColiCudaTensor *t=nullptr;
+    int ok=coli_cuda_tensor_upload_sgguf(&t,offsets,block.data(),0,1,
+                COLI_SGGUF_CODEC_IQ4_NL_EXACT,COLI_SGGUF_LAYOUT_BITMAP_V3,4,16,4,
+                64,1,device)&&
+           coli_cuda_tensor_matmul_host(t,&got,x.data(),1)&&std::fabs(got-96.0f)<1e-4f;
+    if(!ok)std::fprintf(stderr,"SPB3 IQ4_NL tail CUDA mismatch got %.9g\n",got);
     if(t)coli_cuda_tensor_free(t);
     return ok;
 }
@@ -202,6 +233,7 @@ int main(){
            test_sparse_expert_paths(device)&&
            test_new_dense_types(device)&&
            test_sparse_mxfp4_tail(device)&&
+           test_sparse_iq4_nl_tail(device)&&
            test_sparse_iq4_xs(device)&&
            test_native_group_rows(device);
     coli_cuda_shutdown();

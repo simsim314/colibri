@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "split_storage.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -59,6 +61,8 @@ typedef struct {
     uint32_t moe_projection;
     uint32_t expert_count;
     uint32_t rows_per_expert;
+    uint32_t split_location;       /* ColiSplitLocation */
+    uint64_t split_shard_offset;
 } ColiGgufTensorInfo;
 
 typedef struct {
@@ -76,12 +80,18 @@ typedef struct {
     void *mapping;
     void *mapping_handle;
     uint64_t mapping_size;
+    uint64_t physical_file_size;
+    ColiSplitState *split;
+    int preload_backend_kind;
+    int preload_device;
     char error[256];
 } ColiGgufFile;
 
 /* Opens either a standard GGUF or an SGGUF container. The historical name is
  * retained so existing model loaders remain source-compatible. */
 int coli_gguf_open(ColiGgufFile *g, const char *path);
+void coli_gguf_set_preload_backend(ColiGgufFile *g, int backend_kind, int device);
+int coli_gguf_is_split(const ColiGgufFile *g);
 void coli_gguf_close(ColiGgufFile *g);
 
 const char *coli_gguf_error(const ColiGgufFile *g);
@@ -108,6 +118,8 @@ int coli_gguf_kv_read_u32_array(const ColiGgufFile *g, const ColiGgufKV *kv,
 void coli_gguf_free_string_array(char **items, uint64_t count);
 
 const void *coli_gguf_mapped_at(const ColiGgufFile *g, uint64_t offset, uint64_t bytes);
+int coli_gguf_range_is_mmap_backed(const ColiGgufFile *g, uint64_t offset, uint64_t bytes);
+void coli_gguf_drop_source_pages(const ColiGgufFile *g, uint64_t offset, uint64_t bytes);
 int coli_gguf_read_at(const ColiGgufFile *g, uint64_t offset, void *dst, size_t bytes);
 int coli_gguf_read_tensor_bytes(const ColiGgufFile *g,
                                 const ColiGgufTensorInfo *tensor,

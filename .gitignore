@@ -74,3 +74,23 @@ c/gguf-inspect
 
 /obsolete/
 /zip_clean.sh
+
+# Generated SGGUF binaries and local backups
+c/sgguf-convert
+c/sgguf-inspect
+c/sgguf-plan
+c/sgguf-split
+c/sgguf_cuda_test
+c/*.so
+c/*.before-*
+
+# Locally built SGGUF utilities and shared libraries; rebuild with make
+c/sgguf-convert
+c/sgguf-inspect
+c/sgguf-plan
+c/sgguf-split
+c/sgguf_cuda_test
+c/*.so
+
+# Temporary source snapshots created during debugging
+c/*.before*

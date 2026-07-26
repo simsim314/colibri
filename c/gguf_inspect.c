@@ -87,6 +87,11 @@ int main(int argc, char **argv) {
     printf("tensor_count: %llu\n", (unsigned long long)g.tensor_count);
     printf("alignment: %u\n", g.alignment);
     printf("data_offset: %llu\n", (unsigned long long)g.data_offset);
+    if (coli_gguf_is_split(&g)) {
+        printf("split: yes\n");
+        printf("preload_shard: %s\n", coli_split_preload_path(g.split));
+        printf("tail_shard: %s\n", coli_split_tail_path(g.split));
+    }
 
     const ColiGgufKV *arch = coli_gguf_find_kv(&g, "general.architecture");
     char *arch_value = NULL;
@@ -127,9 +132,10 @@ int main(int argc, char **argv) {
         }
         printf("tensor: %s type=%s(%u) dims=", t->name, coli_ggml_type_name(t->type), t->type);
         print_dims(t);
-        printf(" relative_offset=%llu absolute_offset=%llu\n",
+        printf(" relative_offset=%llu absolute_offset=%llu location=%s\n",
                (unsigned long long)t->offset,
-               (unsigned long long)t->absolute_offset);
+               (unsigned long long)t->absolute_offset,
+               coli_split_location_name(t->split_location));
     }
 
     if (show_metadata) {
@@ -148,9 +154,10 @@ int main(int argc, char **argv) {
             const ColiGgufTensorInfo *t = &g.tensors[i];
             printf("  %s type=%s(%u) dims=", t->name, coli_ggml_type_name(t->type), t->type);
             print_dims(t);
-            printf(" relative_offset=%llu absolute_offset=%llu\n",
+            printf(" relative_offset=%llu absolute_offset=%llu location=%s\n",
                    (unsigned long long)t->offset,
-                   (unsigned long long)t->absolute_offset);
+                   (unsigned long long)t->absolute_offset,
+                   coli_split_location_name(t->split_location));
         }
     }
 

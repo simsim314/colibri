@@ -65,7 +65,19 @@ int coli_tensor_bind_gguf(const ColiGgufFile *file,
         out->sparse_tensor = sparse;
         out->sparse_first_block = 0;
         out->sparse_block_count = sparse.total_blocks;
-        out->mmap_backed = 1;
+        out->mmap_backed = coli_gguf_range_is_mmap_backed(
+            file, info->absolute_offset, info->payload_size);
+        out->split_location = info->split_location;
+#ifdef COLI_CUDA
+        if (info->split_location == COLI_SPLIT_PRELOAD_VRAM &&
+            file->preload_backend_kind == COLI_BACKEND_CUDA) {
+            ColiExec preload = { COLI_BACKEND_CUDA, file->preload_device };
+            if (coli_tensor_reside(&preload, out))
+                coli_gguf_drop_source_pages(file, info->absolute_offset, info->payload_size);
+            else if (getenv("COLI_SPLIT_VERBOSE"))
+                fprintf(stderr, "[SPLIT] VRAM preload failed for %s; retaining mmap fallback\n", info->name);
+        }
+#endif
         if (error && error_size) error[0] = 0;
         return 1;
     }
@@ -93,8 +105,88 @@ int coli_tensor_bind_gguf(const ColiGgufFile *file,
     out->storage_bytes = bytes;
     out->data = data;
     out->source_offset = info->absolute_offset;
-    out->mmap_backed = 1;
+    out->mmap_backed = coli_gguf_range_is_mmap_backed(file, info->absolute_offset, bytes);
     out->storage_kind = COLI_TENSOR_STORAGE_DENSE;
+    out->split_location = info->split_location;
+#ifdef COLI_CUDA
+    if (info->split_location == COLI_SPLIT_PRELOAD_VRAM &&
+        file->preload_backend_kind == COLI_BACKEND_CUDA) {
+        ColiExec preload = { COLI_BACKEND_CUDA, file->preload_device };
+        if (coli_tensor_reside(&preload, out))
+            coli_gguf_drop_source_pages(file, info->absolute_offset, bytes);
+        else if (getenv("COLI_SPLIT_VERBOSE"))
+            fprintf(stderr, "[SPLIT] VRAM preload failed for %s; retaining mmap fallback\n", info->name);
+    }
+#endif
+    if (error && error_size) error[0] = 0;
+    return 1;
+}
+
+int coli_tensor_bind_gguf_rows(const ColiGgufFile *file,
+                               const ColiGgufTensorInfo *info,
+                               uint64_t first_row, uint64_t row_count,
+                               ColiTensor *out,
+                               char *error, size_t error_size) {
+    if (!file || !info || !out || !row_count)
+        return fail(error, error_size, "invalid GGUF row binding arguments");
+    if (info->storage_kind != COLI_TENSOR_STORAGE_DENSE)
+        return fail(error, error_size,
+                    "tensor '%s': direct fragmented rows require dense GGUF storage",
+                    info->name ? info->name : "<unnamed>");
+
+    const ColiDTypeTraits *traits = coli_dtype_traits((ColiDType)info->type);
+    if (!traits)
+        return fail(error, error_size, "tensor '%s': unsupported dtype %u",
+                    info->name ? info->name : "<unnamed>", info->type);
+
+    uint64_t elements = 0, full_bytes = 0, row_bytes = 0;
+    if (!coli_dtype_tensor_size((ColiDType)info->type, info->dims, info->n_dims,
+                                &elements, &full_bytes) ||
+        !coli_dtype_row_size((ColiDType)info->type, info->dims[0], &row_bytes) ||
+        !info->dims[0])
+        return fail(error, error_size, "tensor '%s': invalid dense row geometry",
+                    info->name ? info->name : "<unnamed>");
+
+    const uint64_t total_rows = elements / info->dims[0];
+    if (first_row > total_rows || row_count > total_rows - first_row ||
+        first_row > UINT64_MAX / row_bytes ||
+        row_count > UINT64_MAX / row_bytes)
+        return fail(error, error_size, "tensor '%s': row slice outside bounds",
+                    info->name ? info->name : "<unnamed>");
+
+    const uint64_t relative = first_row * row_bytes;
+    const uint64_t bytes = row_count * row_bytes;
+    if (relative > info->payload_size || bytes > info->payload_size - relative)
+        return fail(error, error_size, "tensor '%s': row slice exceeds payload",
+                    info->name ? info->name : "<unnamed>");
+    const uint64_t source_offset = info->absolute_offset + relative;
+    if (source_offset < info->absolute_offset)
+        return fail(error, error_size, "tensor '%s': row offset overflow",
+                    info->name ? info->name : "<unnamed>");
+
+    const uint8_t *data = (const uint8_t *)coli_gguf_mapped_at(file, source_offset, bytes);
+    if (!data)
+        return fail(error, error_size,
+                    "tensor '%s': expert row fragment is not a contiguous mapped range",
+                    info->name ? info->name : "<unnamed>");
+
+    memset(out, 0, sizeof(*out));
+    out->name = info->name;
+    out->dtype = (ColiDType)info->type;
+    out->n_dims = 2;
+    out->dims[0] = info->dims[0];
+    out->dims[1] = row_count;
+    out->element_count = row_count * info->dims[0];
+    out->row_count = row_count;
+    out->row_bytes = row_bytes;
+    out->storage_bytes = bytes;
+    out->data = data;
+    out->source_offset = source_offset;
+    out->storage_kind = COLI_TENSOR_STORAGE_DENSE;
+    out->mmap_backed = coli_gguf_range_is_mmap_backed(file, source_offset, bytes);
+    out->split_location = file->split
+        ? coli_split_location_at(file->split, source_offset, bytes)
+        : info->split_location;
     if (error && error_size) error[0] = 0;
     return 1;
 }
@@ -133,7 +225,8 @@ int coli_tensor_rows_view(const ColiTensor *tensor,
             ? (end - begin) + (block_count + 1u) * tensor->sparse_tensor.offset_width
             : 0;
         out->source_offset = tensor->source_offset;
-        out->mmap_backed = 1;
+        out->mmap_backed = tensor->mmap_backed;
+        out->split_location = tensor->split_location;
         return 1;
     }
     if (!tensor->data) return 0;
@@ -156,6 +249,7 @@ int coli_tensor_rows_view(const ColiTensor *tensor,
     out->data = tensor->data + byte_offset;
     out->source_offset = tensor->source_offset + byte_offset;
     out->mmap_backed = tensor->mmap_backed;
+    out->split_location = tensor->split_location;
 #ifdef COLI_CUDA
     if (tensor->cuda) {
         if (!coli_cuda_tensor_view_rows(tensor->cuda, first_row, row_count, &out->cuda)) {

@@ -71,6 +71,14 @@ int main(void) {
     assert(coli_ggml_dequantize_row(15,q8k,256,y));
     near(y[0],-2); near(y[16],2); near(y[17],-2);
 
+    uint8_t iq4nl[18] = {0};
+    put_u16(iq4nl,0x3c00); /* d = 1 */
+    for(int i=0;i<16;i++) iq4nl[2+i]=0xf8;
+    assert(coli_ggml_dequantize_row(20,iq4nl,32,y));
+    near(y[0],1); near(y[15],1); near(y[16],113); near(y[31],113);
+    near(coli_dtype_dot_f32(COLI_DTYPE_IQ4_NL,iq4nl,y,32),
+         16.0f + 16.0f*113.0f*113.0f);
+
     uint8_t iq4xs[136] = {0};
     put_u16(iq4xs,0x3c00); /* d = 1 */
     put_u16(iq4xs+2,0xaaaa); /* high two scale bits = 2 */

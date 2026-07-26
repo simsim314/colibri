@@ -56,9 +56,10 @@ static void write_fixture(const char *path){
 }
 
 int main(void){
-    uint8_t q4[144],q5[176],q6[210],bf16[512],iq4xs[136]={0},mxfp4[17]={0};
+    uint8_t q4[144],q5[176],q6[210],bf16[512],iq4nl[18]={0},iq4xs[136]={0},mxfp4[17]={0};
     fill_q4k(q4,0x3c00);fill_q5k(q5,0x3c00);fill_q6k(q6,0x3c00);
     for(int i=0;i<256;i++)put_u16(bf16+2*i,0x3f80);
+    put_u16(iq4nl,0x3c00);memset(iq4nl+2,0x88,16);
     put_u16(iq4xs,0x3c00);put_u16(iq4xs+2,0xaaaa);for(int i=0;i<4;i++)iq4xs[4+i]=0x11;
     memset(iq4xs+8,0x88,128);
     mxfp4[0]=127;memset(mxfp4+1,0x11,16);
@@ -66,6 +67,7 @@ int main(void){
     test_direct(COLI_DTYPE_Q5_K,q5,sizeof(q5),256.f);
     test_direct(COLI_DTYPE_Q6_K,q6,sizeof(q6),256.f);
     test_direct(COLI_DTYPE_BF16,bf16,sizeof(bf16),256.f);
+    test_direct_n(COLI_DTYPE_IQ4_NL,iq4nl,sizeof(iq4nl),32,32.f);
     test_direct(COLI_DTYPE_IQ4_XS,iq4xs,sizeof(iq4xs),256.f);
     test_direct_n(COLI_DTYPE_MXFP4,mxfp4,sizeof(mxfp4),32,16.f);
 
@@ -88,5 +90,5 @@ int main(void){
     ColiTensor v;assert(coli_tensor_rows_view(&t,1,1,&v));
     assert(v.data==t.data+144&&v.storage_bytes==144);assert(coli_tensor_matmul(&cpu,y,x,&v,1,256,1));near(y[0],512.f);
     coli_tensor_destroy(&v);coli_tensor_destroy(&t);coli_gguf_close(&g);unlink(path);
-    puts("test_tensor: mmap/native Q4_K/Q5_K/Q6_K/BF16/IQ4_XS/MXFP4 CPU ok");return 0;
+    puts("test_tensor: mmap/native Q4_K/Q5_K/Q6_K/BF16/IQ4_NL/IQ4_XS/MXFP4 CPU ok");return 0;
 }

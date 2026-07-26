@@ -200,6 +200,9 @@ static void test_model_load_and_forward(void) {
     snprintf(path, sizeof(path), "/tmp/test_gptoss_%ld.gguf", (long)getpid());
 #endif
     write_fixture(path);
+    char usage_path[320];
+    snprintf(usage_path, sizeof(usage_path), "%s.coli_usage", path);
+    unlink(usage_path);
     GptOssModel m;
     GptOssScratch s = {0};
     ColiExec exec = {COLI_BACKEND_CPU, 0};
@@ -212,8 +215,21 @@ static void test_model_load_and_forward(void) {
     assert(argmax(s.logits, m.vocab) == 1);
     assert(model_forward(&m, &s, 2, 1, err, sizeof(err)));
     assert(argmax(s.logits, m.vocab) == 2);
+    assert(gptoss_usage_save(&m));
+    FILE *usage = fopen(usage_path, "r");
+    assert(usage);
+    int layer = -1, expert = -1;
+    unsigned count = 0, total = 0;
+    while (fscanf(usage, "%d %d %u", &layer, &expert, &count) == 3) {
+        assert(layer == 0);
+        assert(expert >= 0 && expert < m.n_experts);
+        total += count;
+    }
+    fclose(usage);
+    assert(total == 2);
     scratch_free(&s);
     model_free(&m);
+    unlink(usage_path);
     unlink(path);
 }
 

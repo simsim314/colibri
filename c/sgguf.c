@@ -56,6 +56,7 @@ const char *coli_sgguf_codec_name(uint32_t codec_id) {
         case COLI_SGGUF_CODEC_Q8_K_EXACT: return "q8_k-exact";
         case COLI_SGGUF_CODEC_MXFP4_EXACT: return "mxfp4-exact";
         case COLI_SGGUF_CODEC_IQ4_XS_EXACT: return "iq4_xs-exact";
+        case COLI_SGGUF_CODEC_IQ4_NL_EXACT: return "iq4_nl-exact";
         default: return "unknown";
     }
 }
@@ -75,6 +76,7 @@ uint16_t coli_sgguf_codec_aux_bytes(uint32_t codec_id) {
         case COLI_SGGUF_CODEC_Q8_K_EXACT: return 4;
         case COLI_SGGUF_CODEC_MXFP4_EXACT: return 8;
         case COLI_SGGUF_CODEC_IQ4_XS_EXACT: return 8;
+        case COLI_SGGUF_CODEC_IQ4_NL_EXACT: return 16;
         case COLI_SGGUF_CODEC_RETAINED_F16:
         case COLI_SGGUF_CODEC_RETAINED_BF16:
         case COLI_SGGUF_CODEC_RETAINED_F32: return 0;
@@ -90,6 +92,7 @@ uint16_t coli_sgguf_codec_value_bits(uint32_t codec_id) {
         case COLI_SGGUF_CODEC_Q4_K_EXACT: return 4;
         case COLI_SGGUF_CODEC_MXFP4_EXACT: return 4;
         case COLI_SGGUF_CODEC_IQ4_XS_EXACT: return 4;
+        case COLI_SGGUF_CODEC_IQ4_NL_EXACT: return 4;
         case COLI_SGGUF_CODEC_Q5_0_EXACT:
         case COLI_SGGUF_CODEC_Q5_1_EXACT:
         case COLI_SGGUF_CODEC_Q5_K_EXACT: return 5;
@@ -574,6 +577,20 @@ static float sparse_value(const ColiSggufSparseBlock *b,
             if (native >= 8u) break;
             uint32_t code = read_packed_bits(b->retained_values, retained_index * 4u, 4u);
             return coli_mxfp4_code_to_fp32(b->auxiliary[native], (uint8_t)code);
+        }
+        case COLI_SGGUF_CODEC_IQ4_NL_EXACT: {
+            if (b->auxiliary_bytes != 16 || b->retained_value_bits != 4) break;
+            uint32_t native = dense_position >> 5;
+            if (native >= 8u) break;
+            float d = coli_fp16_to_fp32(
+                coli_sgguf_load_u16_le(b->auxiliary + native * 2u));
+            uint32_t code = read_packed_bits(
+                b->retained_values, retained_index * 4u, 4u);
+            static const int8_t iq4nl_values[16] = {
+                -127, -104, -83, -65, -49, -35, -22, -10,
+                   1,   13,  25,  38,  53,  69,  89, 113,
+            };
+            return d * (float)iq4nl_values[code & 15u];
         }
         case COLI_SGGUF_CODEC_IQ4_XS_EXACT: {
             if (b->auxiliary_bytes != 8 || b->retained_value_bits != 4) break;

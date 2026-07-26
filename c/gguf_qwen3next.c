@@ -1615,6 +1615,7 @@ static int qwen_load_model(QwenModel *m, const char *path, int context, int verb
     m->gguf.fd = -1; m->verbose = verbose; m->exec = exec;
     if (!coli_gguf_open(&m->gguf, path))
         return qwen_errf(err, cap, "cannot open GGUF: %s", coli_gguf_error(&m->gguf));
+    coli_gguf_set_preload_backend(&m->gguf, exec.kind, exec.device);
     if (!qwen_model_config(m, err, cap)) return 0;
     if (!coli_gguf_tokenizer_load(&m->tokenizer, &m->gguf, err, cap)) return 0;
     if (coli_gguf_tokenizer_vocab_size(m->tokenizer) != m->vocab)

@@ -203,6 +203,7 @@ __host__ __device__ static size_t ggml_row_bytes(uint32_t type, int I) {
         size_t bs = type == 2 ? 18 : (type == 3 ? 20 : (type == 6 ? 22 : (type == 7 ? 24 : (type == 8 ? 34 : 36))));
         return (size_t)(I / 32) * bs;
     }
+    if (type == 20 && (I % 32) == 0) return (size_t)(I / 32) * 18;
     if (type == 23 && (I % 256) == 0) return (size_t)(I / 256) * 136;
     if (type == 39 && (I % 32) == 0) return (size_t)(I / 32) * 17;
     if ((type == 11 || type == 12 || type == 13 || type == 14 || type == 15) && (I % 256) == 0) {
@@ -276,6 +277,11 @@ __device__ static float ggml_weight(const uint8_t *row,uint32_t type,int i){
         if(bits==5){uint32_t high=(ggml_u32(p+(type==6?2:4))>>local)&1u;q|=(int)(high<<4);}
         float d=ggml_f16(p);float bias=type==3||type==7?ggml_f16(p+2):0.0f;
         int zero=type==2?8:(type==6?16:0);return d*(q-zero)+bias;
+    }
+    if(type==20){
+        const uint8_t *p=row+(size_t)(i>>5)*18;int local=i&31;
+        uint8_t packed=p[2+(local&15)];uint8_t code=local<16?(packed&15u):(packed>>4);
+        return ggml_f16(p)*iq4nl_code(code);
     }
     if(type==39){
         const uint8_t *p=row+(size_t)(i>>5)*17;int local=i&31;
@@ -455,6 +461,11 @@ __device__ static float sgguf_sparse_value(uint32_t codec,const uint8_t *aux,
     if(codec==COLI_SGGUF_CODEC_MXFP4_EXACT){
         uint32_t code=sgguf_read_bits(values,retained_index*4u,4);
         return mxfp4_code(aux[dense>>5],(uint8_t)code);
+    }
+    if(codec==COLI_SGGUF_CODEC_IQ4_NL_EXACT){
+        uint32_t native=dense>>5;
+        uint32_t code=sgguf_read_bits(values,retained_index*4u,4);
+        return ggml_f16(aux+native*2u)*iq4nl_code((uint8_t)code);
     }
     if(codec==COLI_SGGUF_CODEC_IQ4_XS_EXACT){
         uint32_t subgroup=dense>>5;

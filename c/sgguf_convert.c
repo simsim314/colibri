@@ -192,6 +192,7 @@ static uint32_t choose_codec(uint32_t type, uint32_t forced_codec) {
         case COLI_DTYPE_Q6_K: return COLI_SGGUF_CODEC_Q6_K_EXACT;
         case COLI_DTYPE_Q8_K: return COLI_SGGUF_CODEC_Q8_K_EXACT;
         case COLI_DTYPE_MXFP4: return COLI_SGGUF_CODEC_MXFP4_EXACT;
+        case COLI_DTYPE_IQ4_NL: return COLI_SGGUF_CODEC_IQ4_NL_EXACT;
         case COLI_DTYPE_IQ4_XS: return COLI_SGGUF_CODEC_IQ4_XS_EXACT;
         default: return COLI_SGGUF_CODEC_RETAINED_F16;
     }
@@ -418,6 +419,25 @@ static int write_sparse_block(FILE *out, uint32_t source_type, uint32_t codec, c
             uint8_t packed = encoded[native * 17u + 1u + (local & 15u)];
             uint8_t code = local < 16u ? (packed & 15u) : (packed >> 4);
             pack_bits(values, k++ * 4u, code, 4);
+        }
+        value_bytes = (retained * 4u + 7u) / 8u;
+    } else if (codec == COLI_SGGUF_CODEC_IQ4_NL_EXACT) {
+        /* Eight native 32-value IQ4_NL blocks form one 256-value sparse
+         * group. Preserve each FP16 scale exactly; retain original nonlinear
+         * four-bit codes only for occupied positions. Tail groups use only
+         * the leading native blocks and leave the remaining scales zero. */
+        aux_bytes = 16; value_bits = 4;
+        memset(aux, 0, aux_bytes);
+        uint32_t native_blocks = (logical_count + 31u) / 32u;
+        for (uint32_t n = 0; n < native_blocks; ++n)
+            memcpy(aux + n * 2u, encoded + n * 18u, 2u);
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i]) {
+            uint32_t native = i >> 5;
+            uint32_t local = i & 31u;
+            uint8_t packed = encoded[native * 18u + 2u + (local & 15u)];
+            uint8_t code = local < 16u ? (packed & 15u) : (packed >> 4);
+            pack_bits(values, k++ * 4u, code, 4u);
         }
         value_bytes = (retained * 4u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_IQ4_XS_EXACT) {
