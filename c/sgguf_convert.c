@@ -49,6 +49,7 @@ typedef struct {
     int verify;
     int verbose;
     uint32_t jobs;
+    uint64_t max_output_bytes;
 } ConvertOptions;
 
 typedef struct {
@@ -190,6 +191,8 @@ static uint32_t choose_codec(uint32_t type, uint32_t forced_codec) {
         case COLI_DTYPE_Q5_K: return COLI_SGGUF_CODEC_Q5_K_EXACT;
         case COLI_DTYPE_Q6_K: return COLI_SGGUF_CODEC_Q6_K_EXACT;
         case COLI_DTYPE_Q8_K: return COLI_SGGUF_CODEC_Q8_K_EXACT;
+        case COLI_DTYPE_MXFP4: return COLI_SGGUF_CODEC_MXFP4_EXACT;
+        case COLI_DTYPE_IQ4_XS: return COLI_SGGUF_CODEC_IQ4_XS_EXACT;
         default: return COLI_SGGUF_CODEC_RETAINED_F16;
     }
 }
@@ -311,13 +314,14 @@ static void pack_bits(uint8_t *dst, uint32_t bit_offset, uint32_t value, uint32_
 }
 
 static int write_sparse_block(FILE *out, uint32_t source_type, uint32_t codec, const uint8_t *encoded,
-                              const float decoded[256], float threshold,
+                              const float decoded[256], uint32_t logical_count, float threshold,
                               uint64_t *retained_total, uint64_t *bitmap_bytes_total,
                               uint64_t *value_bytes_total, uint64_t *aux_bytes_total) {
-    uint8_t keep[256];
+    if (!logical_count || logical_count > COLI_SGGUF_GROUP_SIZE) return 0;
+    uint8_t keep[256] = {0};
     uint8_t bitmap[COLI_SGGUF_BITMAP_BYTES];
     uint32_t retained = 0;
-    for (uint32_t i = 0; i < 256; ++i) {
+    for (uint32_t i = 0; i < logical_count; ++i) {
         /* Values strictly below threshold are omitted. NaN/Inf are retained. */
         keep[i] = !(fabsf(decoded[i]) < threshold);
         retained += keep[i] != 0;
@@ -331,81 +335,112 @@ static int write_sparse_block(FILE *out, uint32_t source_type, uint32_t codec, c
     uint32_t value_bytes = 0;
 
     if (codec == COLI_SGGUF_CODEC_Q4_0_EXACT) {
-        aux_bytes = 16; value_bits = 4;
-        for (uint32_t n = 0; n < 8; ++n) memcpy(aux + n * 2u, encoded + n * 18u, 2);
+        aux_bytes = 16; value_bits = 4; memset(aux, 0, aux_bytes);
+        for (uint32_t n = 0; n < (logical_count + 31u) / 32u; ++n) memcpy(aux + n * 2u, encoded + n * 18u, 2);
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 4u, q4_0_or_q4_1_code(encoded, i, 2), 4);
         value_bytes = (retained * 4u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q4_1_EXACT) {
-        aux_bytes = 32; value_bits = 4;
-        for (uint32_t n = 0; n < 8; ++n) memcpy(aux + n * 4u, encoded + n * 20u, 4);
+        aux_bytes = 32; value_bits = 4; memset(aux, 0, aux_bytes);
+        for (uint32_t n = 0; n < (logical_count + 31u) / 32u; ++n) memcpy(aux + n * 4u, encoded + n * 20u, 4);
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 4u, q4_0_or_q4_1_code(encoded, i, 4), 4);
         value_bytes = (retained * 4u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q5_0_EXACT) {
-        aux_bytes = 16; value_bits = 5;
-        for (uint32_t n = 0; n < 8; ++n) memcpy(aux + n * 2u, encoded + n * 22u, 2);
+        aux_bytes = 16; value_bits = 5; memset(aux, 0, aux_bytes);
+        for (uint32_t n = 0; n < (logical_count + 31u) / 32u; ++n) memcpy(aux + n * 2u, encoded + n * 22u, 2);
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 5u, q5_code(encoded, i, 0), 5);
         value_bytes = (retained * 5u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q5_1_EXACT) {
-        aux_bytes = 32; value_bits = 5;
-        for (uint32_t n = 0; n < 8; ++n) memcpy(aux + n * 4u, encoded + n * 24u, 4);
+        aux_bytes = 32; value_bits = 5; memset(aux, 0, aux_bytes);
+        for (uint32_t n = 0; n < (logical_count + 31u) / 32u; ++n) memcpy(aux + n * 4u, encoded + n * 24u, 4);
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 5u, q5_code(encoded, i, 1), 5);
         value_bytes = (retained * 5u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q8_0_EXACT) {
-        aux_bytes = 16; value_bits = 8;
-        for (uint32_t n = 0; n < 8; ++n) memcpy(aux + n * 2u, encoded + n * 34u, 2);
+        aux_bytes = 16; value_bits = 8; memset(aux, 0, aux_bytes);
+        for (uint32_t n = 0; n < (logical_count + 31u) / 32u; ++n) memcpy(aux + n * 2u, encoded + n * 34u, 2);
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             values[k++] = encoded[(i >> 5) * 34u + 2u + (i & 31u)];
         value_bytes = retained;
     } else if (codec == COLI_SGGUF_CODEC_Q8_1_EXACT) {
-        aux_bytes = 32; value_bits = 8;
-        for (uint32_t n = 0; n < 8; ++n) memcpy(aux + n * 4u, encoded + n * 36u, 4);
+        aux_bytes = 32; value_bits = 8; memset(aux, 0, aux_bytes);
+        for (uint32_t n = 0; n < (logical_count + 31u) / 32u; ++n) memcpy(aux + n * 4u, encoded + n * 36u, 4);
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             values[k++] = encoded[(i >> 5) * 36u + 4u + (i & 31u)];
         value_bytes = retained;
     } else if (codec == COLI_SGGUF_CODEC_Q3_K_EXACT) {
         memcpy(aux, encoded + 96, 14); aux_bytes = 14; value_bits = 3;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 3u, q3_k_code(encoded, i), 3);
         value_bytes = (retained * 3u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q6_K_EXACT) {
         memcpy(aux, encoded + 192, 18); aux_bytes = 18; value_bits = 6;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 6u, q6_k_code(encoded, i), 6);
         value_bytes = (retained * 6u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q4_K_EXACT) {
         memcpy(aux, encoded, 16); aux_bytes = 16; value_bits = 4;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 4u, q4_k_code(encoded, i), 4);
         value_bytes = (retained * 4u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q5_K_EXACT) {
         memcpy(aux, encoded, 16); aux_bytes = 16; value_bits = 5;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             pack_bits(values, k++ * 5u, q5_k_code(encoded, i), 5);
         value_bytes = (retained * 5u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_Q8_K_EXACT) {
         memcpy(aux, encoded, 4); aux_bytes = 4; value_bits = 8;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i])
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i])
             values[k++] = encoded[4u + i];
         value_bytes = retained;
+    } else if (codec == COLI_SGGUF_CODEC_MXFP4_EXACT) {
+        aux_bytes = 8; value_bits = 4;
+        memset(aux, 0, aux_bytes);
+        uint32_t native_blocks = (logical_count + 31u) / 32u;
+        for (uint32_t n = 0; n < native_blocks; ++n) aux[n] = encoded[n * 17u];
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i]) {
+            uint32_t native = i >> 5;
+            uint32_t local = i & 31u;
+            uint8_t packed = encoded[native * 17u + 1u + (local & 15u)];
+            uint8_t code = local < 16u ? (packed & 15u) : (packed >> 4);
+            pack_bits(values, k++ * 4u, code, 4);
+        }
+        value_bytes = (retained * 4u + 7u) / 8u;
+    } else if (codec == COLI_SGGUF_CODEC_IQ4_XS_EXACT) {
+        /* One IQ4_XS source block is exactly one 256-value SGGUF group.
+         * Preserve its FP16 super-scale and packed 6-bit subgroup scales in
+         * the fixed auxiliary bytes, then retain the original nonlinear
+         * 4-bit code for every occupied logical position. */
+        if (logical_count != COLI_SGGUF_GROUP_SIZE) return 0;
+        aux_bytes = 8; value_bits = 4;
+        memcpy(aux, encoded, aux_bytes);
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i]) {
+            uint32_t subgroup = i >> 5;
+            uint32_t local = i & 31u;
+            uint8_t packed = encoded[8u + subgroup * 16u + (local & 15u)];
+            uint8_t code = local < 16u ? (packed & 15u) : (packed >> 4);
+            pack_bits(values, k++ * 4u, code, 4);
+        }
+        value_bytes = (retained * 4u + 7u) / 8u;
     } else if (codec == COLI_SGGUF_CODEC_RETAINED_F16) {
         value_bits = 16;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i]) {
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i]) {
             uint16_t h;
             if (source_type == COLI_DTYPE_F16)
                 h = coli_sgguf_load_u16_le(encoded + i * 2u);
@@ -417,7 +452,7 @@ static int write_sparse_block(FILE *out, uint32_t source_type, uint32_t codec, c
     } else if (codec == COLI_SGGUF_CODEC_RETAINED_BF16) {
         value_bits = 16;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i]) {
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i]) {
             uint16_t h;
             if (source_type == COLI_DTYPE_BF16)
                 h = coli_sgguf_load_u16_le(encoded + i * 2u);
@@ -429,7 +464,7 @@ static int write_sparse_block(FILE *out, uint32_t source_type, uint32_t codec, c
     } else if (codec == COLI_SGGUF_CODEC_RETAINED_F32) {
         value_bits = 32;
         uint32_t k = 0;
-        for (uint32_t i = 0; i < 256; ++i) if (keep[i]) {
+        for (uint32_t i = 0; i < logical_count; ++i) if (keep[i]) {
             uint32_t u;
             if (source_type == COLI_DTYPE_F32)
                 u = coli_sgguf_load_u32_le(encoded + i * 4u);
@@ -527,7 +562,6 @@ static int encode_expert_range(FILE *part,
                                const uint8_t *tensor_data,
                                uint64_t row_bytes,
                                uint32_t blocks_per_row,
-                               uint64_t encoded_group_bytes,
                                uint32_t codec,
                                float threshold,
                                uint32_t first_expert,
@@ -558,9 +592,14 @@ static int encode_expert_range(FILE *part,
                     return 0;
                 }
                 offsets[block_index] = (uint32_t)relative;
-                const uint8_t *group = row_data + (uint64_t)b * encoded_group_bytes;
-                if (!coli_dtype_dequantize_row((ColiDType)t->type, group, 256, decoded) ||
-                    !write_sparse_block(part, t->type, codec, group, decoded, threshold,
+                const uint32_t first_col = b * COLI_SGGUF_GROUP_SIZE;
+                const uint32_t logical_count = first_col + COLI_SGGUF_GROUP_SIZE <= t->dims[0]
+                    ? COLI_SGGUF_GROUP_SIZE : (uint32_t)t->dims[0] - first_col;
+                const uint64_t source_block = first_col / traits->block_values;
+                const uint8_t *group = row_data + source_block * traits->block_bytes;
+                memset(decoded, 0, sizeof(decoded));
+                if (!coli_dtype_dequantize_row((ColiDType)t->type, group, logical_count, decoded) ||
+                    !write_sparse_block(part, t->type, codec, group, decoded, logical_count, threshold,
                                         &stats->retained_total, &stats->tree_total,
                                         &stats->value_total, &stats->aux_total)) {
                     if (failed_block) *failed_block = block_index;
@@ -582,7 +621,6 @@ static int encode_tensor_multiprocess(FILE *out,
                                       const uint8_t *tensor_data,
                                       uint64_t row_bytes,
                                       uint32_t blocks_per_row,
-                                      uint64_t encoded_group_bytes,
                                       uint32_t codec,
                                       float threshold,
                                       uint32_t jobs,
@@ -636,7 +674,7 @@ static int encode_tensor_multiprocess(FILE *out,
             uint64_t failed = UINT64_MAX;
             int child_ok = encode_expert_range(
                 parts[w], t, traits, tensor_data, row_bytes,
-                blocks_per_row, encoded_group_bytes, codec, threshold,
+                blocks_per_row, codec, threshold,
                 results[w].first_expert, results[w].end_expert,
                 offsets, &local, progress, &failed);
             uint64_t end = tell64(parts[w]);
@@ -749,14 +787,15 @@ static int write_sparse_tensor(FILE *out, const ColiGgufFile *src,
                                int verbose, uint32_t requested_jobs,
                                const char *tmp_prefix, uint64_t tensor_id) {
     const ColiDTypeTraits *traits = coli_dtype_traits((ColiDType)t->type);
-    if (!traits || t->n_dims != 3 || t->dims[0] == 0 || t->dims[0] % 256u ||
+    if (!traits || t->n_dims != 3 || t->dims[0] == 0 ||
+        t->dims[0] % traits->block_values ||
         t->dims[1] > UINT32_MAX || t->dims[2] > UINT32_MAX || t->dims[0] > UINT32_MAX)
         return 0;
 
     uint64_t row_bytes = 0;
     if (!coli_dtype_row_size((ColiDType)t->type, t->dims[0], &row_bytes)) return 0;
     uint64_t total_rows = t->dims[1] * t->dims[2];
-    uint32_t blocks_per_row = (uint32_t)(t->dims[0] / 256u);
+    uint32_t blocks_per_row = (uint32_t)((t->dims[0] + 255u) / 256u);
     if (total_rows > UINT64_MAX / blocks_per_row) return 0;
     uint64_t total_blocks = total_rows * blocks_per_row;
     if (total_blocks > (SIZE_MAX / sizeof(uint32_t)) - 1u) return 0;
@@ -794,7 +833,6 @@ static int write_sparse_tensor(FILE *out, const ColiGgufFile *src,
 
     const uint8_t *tensor_data = (const uint8_t *)coli_gguf_mapped_at(src, t->absolute_offset, t->payload_size);
     if (!tensor_data) goto fail;
-    uint64_t encoded_group_bytes = (256u / traits->block_values) * traits->block_bytes;
     SparseStats stats = {0, 0, 0, 0};
     double started = monotonic_seconds();
     int encoded_ok = 0;
@@ -803,7 +841,7 @@ static int write_sparse_tensor(FILE *out, const ColiGgufFile *src,
     if (jobs > 1) {
         encoded_ok = encode_tensor_multiprocess(
             out, tmp_prefix, tensor_id, t, traits, tensor_data,
-            row_bytes, blocks_per_row, encoded_group_bytes,
+            row_bytes, blocks_per_row,
             codec, threshold, jobs, offsets, &stats, verbose);
     } else
 #endif
@@ -811,7 +849,7 @@ static int write_sparse_tensor(FILE *out, const ColiGgufFile *src,
         SparseProgress progress = {0};
         encoded_ok = encode_expert_range(
             out, t, traits, tensor_data, row_bytes,
-            blocks_per_row, encoded_group_bytes, codec, threshold,
+            blocks_per_row, codec, threshold,
             0, (uint32_t)t->dims[2], offsets, &stats, &progress, NULL);
         uint64_t end_serial = tell64(out);
         if (encoded_ok && end_serial != UINT64_MAX) {
@@ -832,8 +870,8 @@ static int write_sparse_tensor(FILE *out, const ColiGgufFile *src,
 
     uint8_t header[COLI_SGGUF_SPARSE_TENSOR_HEADER_BYTES];
     memset(header, 0, sizeof(header));
-    memcpy(header, "SPB2", 4);
-    coli_sgguf_store_u32_le(header + 4, 2);
+    memcpy(header, "SPB3", 4);
+    coli_sgguf_store_u32_le(header + 4, 3);
     coli_sgguf_store_u32_le(header + 8, codec);
     coli_sgguf_store_u32_le(header + 12, 256);
     coli_sgguf_store_u32_le(header + 16, (uint32_t)t->dims[0]);
@@ -860,7 +898,8 @@ static int write_sparse_tensor(FILE *out, const ColiGgufFile *src,
     if (verbose) {
         double dense_mib = t->payload_size / (1024.0 * 1024.0);
         double sparse_mib = payload_size / (1024.0 * 1024.0);
-        double keep = total_blocks ? (double)stats.retained_total / (double)(total_blocks * 256u) : 0.0;
+        uint64_t logical_values = total_rows * t->dims[0];
+        double keep = logical_values ? (double)stats.retained_total / (double)logical_values : 0.0;
         double elapsed = monotonic_seconds() - started;
         fprintf(stderr,
             "[SGGUF] %s codec=%s dense=%.2f MiB sparse=%.2f MiB ratio=%.3f retained=%.2f%% bitmap=%.2f MiB values=%.2f MiB aux=%.2f MiB index=%.2f MiB jobs=%u time=%.2fs\n",
@@ -934,22 +973,29 @@ static int verify_sgguf(const char *path, const ColiGgufFile *source, float thre
         }
         const uint8_t *src_data = (const uint8_t *)coli_gguf_mapped_at(
             source, src->absolute_offset, src->payload_size);
-        uint64_t group_bytes = (256u / traits->block_values) * traits->block_bytes;
         uint64_t samples[3] = {0, st.total_blocks / 2u, st.total_blocks - 1u};
         for (int si = 0; si < 3; ++si) {
             uint64_t bi = samples[si];
             if (si && bi == samples[si - 1]) continue;
             uint64_t row = bi / st.blocks_per_row;
             uint64_t block_in_row = bi % st.blocks_per_row;
-            const uint8_t *group = src_data + row * row_bytes + block_in_row * group_bytes;
-            float decoded[256], materialized[256];
-            if (!coli_dtype_dequantize_row((ColiDType)src->type, group, 256, decoded) ||
+            uint32_t first_col = (uint32_t)block_in_row * COLI_SGGUF_GROUP_SIZE;
+            uint32_t logical_count = first_col + COLI_SGGUF_GROUP_SIZE <= src->dims[0]
+                ? COLI_SGGUF_GROUP_SIZE : (uint32_t)src->dims[0] - first_col;
+            uint64_t source_block = first_col / traits->block_values;
+            const uint8_t *group = src_data + row * row_bytes + source_block * traits->block_bytes;
+            float decoded[256] = {0}, materialized[256];
+            if (!coli_dtype_dequantize_row((ColiDType)src->type, group, logical_count, decoded) ||
                 !coli_sgguf_sparse_block_get(&st, bi, &b, err, sizeof(err)) ||
                 !coli_sgguf_sparse_block_materialize_f32(&b, materialized)) {
                 coli_gguf_close(&f); return failf("semantic verification failed for %s block %llu",
                     t->name, (unsigned long long)bi);
             }
-            for (uint32_t j = 0; j < 256; ++j) {
+            if (b.logical_count != logical_count) {
+                coli_gguf_close(&f); return failf("tail-size mismatch in %s block %llu",
+                    t->name, (unsigned long long)bi);
+            }
+            for (uint32_t j = 0; j < logical_count; ++j) {
                 float expected = verify_expected_value(decoded[j], threshold, b.codec_id);
                 if (!same_float_value(expected, materialized[j])) {
                     coli_gguf_close(&f);
@@ -978,8 +1024,10 @@ static int convert_file(const char *input, const char *output, const ConvertOpti
         TensorPlan *p = &plans[i];
         p->storage_kind = COLI_TENSOR_STORAGE_DENSE;
         p->moe_layer = -1;
+        const ColiDTypeTraits *traits = coli_dtype_traits((ColiDType)t->type);
         if (parse_moe_name(t->name, &p->moe_layer, &p->moe_projection) && t->n_dims == 3 &&
-            t->dims[0] % 256u == 0 && t->dims[1] <= UINT32_MAX && t->dims[2] <= UINT32_MAX) {
+            traits && t->dims[0] && t->dims[0] % traits->block_values == 0 &&
+            t->dims[0] <= UINT32_MAX && t->dims[1] <= UINT32_MAX && t->dims[2] <= UINT32_MAX) {
             p->codec_id = choose_codec(t->type, opts->forced_codec);
             if (p->codec_id != COLI_SGGUF_CODEC_NONE) {
                 p->storage_kind = COLI_TENSOR_STORAGE_SPARSE_TREE;
@@ -1008,11 +1056,11 @@ static int convert_file(const char *input, const char *output, const ConvertOpti
              put_u64(out, src.tensor_count) && put_u64(out, src.metadata_count + 5u);
     for (uint64_t i = 0; ok && i < src.metadata_count; ++i)
         ok = write_metadata_copy(out, &src, &src.metadata[i]);
-    ok = ok && put_string(out, "sgguf.version") && put_u32(out, COLI_GGUF_TYPE_UINT32) && put_u32(out, 2);
+    ok = ok && put_string(out, "sgguf.version") && put_u32(out, COLI_GGUF_TYPE_UINT32) && put_u32(out, 3);
     ok = ok && put_string(out, "sgguf.pruning.threshold") && put_u32(out, COLI_GGUF_TYPE_FLOAT32) && put_f32(out, opts->threshold);
     ok = ok && put_string(out, "sgguf.pruning.scope") && put_u32(out, COLI_GGUF_TYPE_STRING) && put_string(out, "routed-moe-experts");
     ok = ok && put_string(out, "sgguf.value.order") && put_u32(out, COLI_GGUF_TYPE_STRING) && put_string(out, "kth-retained-value-is-kth-one-bit");
-    ok = ok && put_string(out, "sgguf.sparse.occupancy") && put_u32(out, COLI_GGUF_TYPE_STRING) && put_string(out, "bitmap256-v2");
+    ok = ok && put_string(out, "sgguf.sparse.occupancy") && put_u32(out, COLI_GGUF_TYPE_STRING) && put_string(out, "bitmap256-v3");
 
     for (uint64_t i = 0; ok && i < src.tensor_count; ++i) {
         const ColiGgufTensorInfo *t = &src.tensors[i];
@@ -1050,6 +1098,14 @@ static int convert_file(const char *input, const char *output, const ConvertOpti
             ok = copy_mapped(out, &src, t->absolute_offset, payload_size);
         }
         if (!ok) break;
+        uint64_t output_pos = tell64(out);
+        if (output_pos == UINT64_MAX ||
+            (opts->max_output_bytes && output_pos > opts->max_output_bytes)) {
+            ok = failf("output exceeded --max-output-gb after tensor %s: %.3f GiB > %.3f GiB",
+                       t->name, output_pos / (1024.0 * 1024.0 * 1024.0),
+                       opts->max_output_bytes / (1024.0 * 1024.0 * 1024.0));
+            break;
+        }
         ok = patch_u64(out, p->offset_patch, relative) &&
              patch_u64(out, p->payload_patch, payload_size) &&
              patch_u64(out, p->index_offset_patch,
@@ -1076,13 +1132,13 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s INPUT.gguf OUTPUT.sgguf [--threshold N] "
         "[--codec auto|preserve|f16|bf16|f32] [--jobs N|auto|--mp N|auto] "
-        "[--no-verify] [--quiet]\n",
+        "[--max-output-gb N] [--no-verify] [--quiet]\n",
         argv0);
 }
 
 int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
-    ConvertOptions opts = { 0.01f, 0, 1, 1, 0 };
+    ConvertOptions opts = { 0.01f, 0, 1, 1, 0, 0 };
     for (int i = 3; i < argc; ++i) {
         if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
             char *end = NULL;
@@ -1113,6 +1169,14 @@ int main(int argc, char **argv) {
                 if (!end || *end || v > 256u) { usage(argv[0]); return 2; }
                 opts.jobs = (uint32_t)v; /* zero also means automatic CPU count */
             }
+        } else if (strcmp(argv[i], "--max-output-gb") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            double gb = strtod(argv[++i], &end);
+            if (!end || *end || !isfinite(gb) || gb <= 0.0 ||
+                gb > (double)UINT64_MAX / (1024.0 * 1024.0 * 1024.0)) {
+                usage(argv[0]); return 2;
+            }
+            opts.max_output_bytes = (uint64_t)(gb * 1024.0 * 1024.0 * 1024.0);
         } else if (strcmp(argv[i], "--no-verify") == 0) opts.verify = 0;
         else if (strcmp(argv[i], "--quiet") == 0) opts.verbose = 0;
         else { usage(argv[0]); return 2; }

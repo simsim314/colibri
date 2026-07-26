@@ -199,9 +199,14 @@ __host__ __device__ static size_t ggml_row_bytes(uint32_t type, int I) {
     if (I < 1) return 0;
     if (type == 0) return (size_t)I * 4;
     if (type == 1 || type == 30) return (size_t)I * 2;
-    if (type == 8 && (I % 32) == 0) return (size_t)(I / 32) * 34;
-    if ((type == 12 || type == 13 || type == 14) && (I % 256) == 0) {
-        size_t bs = type == 12 ? 144 : (type == 13 ? 176 : 210);
+    if ((type == 2 || type == 3 || type == 6 || type == 7 || type == 8 || type == 9) && (I % 32) == 0) {
+        size_t bs = type == 2 ? 18 : (type == 3 ? 20 : (type == 6 ? 22 : (type == 7 ? 24 : (type == 8 ? 34 : 36))));
+        return (size_t)(I / 32) * bs;
+    }
+    if (type == 23 && (I % 256) == 0) return (size_t)(I / 256) * 136;
+    if (type == 39 && (I % 32) == 0) return (size_t)(I / 32) * 17;
+    if ((type == 11 || type == 12 || type == 13 || type == 14 || type == 15) && (I % 256) == 0) {
+        size_t bs = type == 11 ? 110 : (type == 12 ? 144 : (type == 13 ? 176 : (type == 14 ? 210 : 292)));
         return (size_t)(I / 256) * bs;
     }
     return 0;
@@ -233,15 +238,68 @@ __device__ static void ggml_scale_min(int j,const uint8_t *q,int *sc,int *mn){
     if(j<4){*sc=q[j]&63;*mn=q[j+4]&63;}
     else {*sc=(q[j+4]&15)|((q[j-4]>>6)<<4);*mn=(q[j+4]>>4)|((q[j]>>6)<<4);}
 }
+static __device__ __constant__ int8_t k_cuda_mxfp4_values_x2[16]={
+     0, 1, 2, 3, 4, 6, 8, 12, 0,-1,-2,-3,-4,-6,-8,-12
+};
+static __device__ __constant__ int8_t k_cuda_iq4nl_values[16]={
+    -127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113
+};
+__device__ static float mxfp4_scale_half(uint8_t e){
+    if(e==0xffu)return __int_as_float(0x7fc00000);
+    return ldexpf(0.5f,(int)e-127);
+}
+__device__ static float mxfp4_code(uint8_t e,uint8_t code){
+    return mxfp4_scale_half(e)*(float)k_cuda_mxfp4_values_x2[code&15u];
+}
+__device__ static float iq4nl_code(uint8_t code){
+    return (float)k_cuda_iq4nl_values[code&15u];
+}
+__device__ static int ggml_q3_scale_code(const uint8_t *p,uint32_t index){
+    uint32_t aux[4]={ggml_u32(p),ggml_u32(p+4),ggml_u32(p+8),0};
+    const uint32_t k1=0x03030303u,k2=0x0f0f0f0fu;uint32_t tmp=aux[2];
+    aux[2]=((aux[0]>>4)&k2)|(((tmp>>4)&k1)<<4);
+    aux[3]=((aux[1]>>4)&k2)|(((tmp>>6)&k1)<<4);
+    aux[0]=(aux[0]&k2)|(((tmp>>0)&k1)<<4);
+    aux[1]=(aux[1]&k2)|(((tmp>>2)&k1)<<4);
+    return (int)((const uint8_t*)aux)[index]-32;
+}
 __device__ static float ggml_weight(const uint8_t *row,uint32_t type,int i){
     if(type==0) return ggml_f32(row+(size_t)i*4);
     if(type==1) return ggml_f16(row+(size_t)i*2);
     if(type==30) return ggml_bf16(row+(size_t)i*2);
-    if(type==8){
-        const uint8_t *p=row+(size_t)(i>>5)*34;
-        return ggml_f16(p)*(float)(int8_t)p[2+(i&31)];
+    if(type==2||type==3||type==6||type==7||type==8||type==9){
+        int local=i&31;size_t bs=type==2?18:(type==3?20:(type==6?22:(type==7?24:(type==8?34:36))));
+        const uint8_t *p=row+(size_t)(i>>5)*bs;
+        if(type==8||type==9){size_t h=type==8?2:4;return ggml_f16(p)*(float)(int8_t)p[h+local];}
+        int bits=type==6||type==7?5:4;size_t h=type==2?2:(type==3?4:(type==6?6:8));
+        uint8_t packed=p[h+(local&15)];int q=local<16?(packed&15):(packed>>4);
+        if(bits==5){uint32_t high=(ggml_u32(p+(type==6?2:4))>>local)&1u;q|=(int)(high<<4);}
+        float d=ggml_f16(p);float bias=type==3||type==7?ggml_f16(p+2):0.0f;
+        int zero=type==2?8:(type==6?16:0);return d*(q-zero)+bias;
+    }
+    if(type==39){
+        const uint8_t *p=row+(size_t)(i>>5)*17;int local=i&31;
+        uint8_t packed=p[1+(local&15)];uint8_t code=local<16?(packed&15u):(packed>>4);
+        return mxfp4_code(p[0],code);
     }
     int bi=i>>8,j=i&255;
+    if(type==23){
+        const uint8_t *p=row+(size_t)bi*136;float d=ggml_f16(p);
+        uint16_t sh=ggml_u16(p+2);const uint8_t *sl=p+4,*q=p+8;
+        int sb=j>>5,local=j&31;int lo=(sl[sb>>1]>>(4*(sb&1)))&15;
+        int hi=(sh>>(2*sb))&3;float dl=d*(float)((lo|(hi<<4))-32);
+        uint8_t packed=q[sb*16+(local&15)];uint8_t code=local<16?(packed&15u):(packed>>4);
+        return dl*iq4nl_code(code);
+    }
+    if(type==11){
+        const uint8_t *p=row+(size_t)bi*110,*hm=p,*qs=p+32,*sc=p+96;float d=ggml_f16(p+108);
+        int half=j>>7,r=j&127,chunk=r>>5,local=r&31;uint8_t q=qs[half*32+local];
+        int low=(q>>(2*chunk))&3;int high=((hm[local]>>(2*half+chunk))&1)?0:-4;
+        return d*(float)ggml_q3_scale_code(sc,j>>4)*(float)(low+high);
+    }
+    if(type==15){
+        const uint8_t *p=row+(size_t)bi*292;return ggml_f32(p)*(float)(int8_t)p[4+j];
+    }
     if(type==12){
         const uint8_t *p=row+(size_t)bi*144; float d=ggml_f16(p),dm=ggml_f16(p+2);
         const uint8_t *scales=p+4,*q=p+16; int c=j>>6,k=j&63,sc,mn;
@@ -394,6 +452,18 @@ __device__ static float sgguf_sparse_value(uint32_t codec,const uint8_t *aux,
         uint32_t code=sgguf_read_bits(values,retained_index*8u,8);
         return ggml_f32(aux)*(float)(int8_t)code;
     }
+    if(codec==COLI_SGGUF_CODEC_MXFP4_EXACT){
+        uint32_t code=sgguf_read_bits(values,retained_index*4u,4);
+        return mxfp4_code(aux[dense>>5],(uint8_t)code);
+    }
+    if(codec==COLI_SGGUF_CODEC_IQ4_XS_EXACT){
+        uint32_t subgroup=dense>>5;
+        uint16_t sh=ggml_u16(aux+2);uint8_t sl=aux[4+(subgroup>>1)];
+        int low=(sl>>(4*(subgroup&1)))&15,high=(sh>>(2*subgroup))&3;
+        float dl=ggml_f16(aux)*(float)((low|(high<<4))-32);
+        uint32_t code=sgguf_read_bits(values,retained_index*4u,4);
+        return dl*iq4nl_code((uint8_t)code);
+    }
     return 0.f;
 }
 
@@ -415,7 +485,8 @@ __global__ static void sgguf_sparse_matmul(float *y,const float *x,
         if(tid==0){
             valid=0;retained_count_shared=0;aux_shared=nullptr;values_shared=nullptr;
             if(end>=begin){
-                if(sparse_layout==COLI_SGGUF_LAYOUT_BITMAP_V2){
+                if(sparse_layout==COLI_SGGUF_LAYOUT_BITMAP_V2||
+                   sparse_layout==COLI_SGGUF_LAYOUT_BITMAP_V3){
                     uint64_t minimum=COLI_SGGUF_BITMAP_BYTES+(uint64_t)fixed_aux_bytes;
                     if(end-begin>=minimum&&fixed_value_bits){
                         uint32_t retained=0;
@@ -452,14 +523,15 @@ __global__ static void sgguf_sparse_matmul(float *y,const float *x,
         __syncthreads();
         if(!valid){if(tid==0)y[(size_t)s*O+o]=0.f;return;}
         uint32_t word=(uint32_t)tid>>5,bit=(uint32_t)tid&31u;
-        if((occupancy[word]>>bit)&1u){
+        uint32_t dense_col=(uint32_t)b*256u+(uint32_t)tid;
+        if(dense_col<(uint32_t)I&&((occupancy[word]>>bit)&1u)){
             uint32_t k=0;
             for(uint32_t w=0;w<word;w++)k+=(uint32_t)__popc(occupancy[w]);
             uint32_t lower=bit?((1u<<bit)-1u):0u;
             k+=(uint32_t)__popc(occupancy[word]&lower);
             if(k<retained_count_shared){
                 float weight=sgguf_sparse_value(codec,aux_shared,values_shared,(uint32_t)tid,k);
-                sum+=weight*xs[(size_t)b*256u+(uint32_t)tid];
+                sum+=weight*xs[dense_col];
             }
         }
         __syncthreads();
@@ -1126,9 +1198,10 @@ extern "C" int coli_cuda_tensor_upload_sgguf(ColiCudaTensor **tensor,
         uint32_t sparse_layout,uint32_t offset_width,
         uint16_t auxiliary_bytes_per_block,uint16_t retained_value_bits,
         int I,int O,int device){
-    if(!tensor||!block_offsets_le||!blocks||I<1||O<1||I%256||!block_count||
+    if(!tensor||!block_offsets_le||!blocks||I<1||O<1||!block_count||
        (offset_width!=4&&offset_width!=8))return 0;
-    uint64_t expected=(uint64_t)O*(uint64_t)(I/256);
+    uint64_t blocks_per_row=((uint64_t)I+255u)/256u;
+    uint64_t expected=(uint64_t)O*blocks_per_row;
     if(block_count!=expected||block_count>SIZE_MAX/sizeof(uint64_t)-1u)return 0;
     uint64_t first=sgguf_host_offset(block_offsets_le,first_block,offset_width);
     uint64_t last=sgguf_host_offset(block_offsets_le,first_block+block_count,offset_width);
@@ -1152,7 +1225,7 @@ extern "C" int coli_cuda_tensor_upload_sgguf(ColiCudaTensor **tensor,
     ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t));if(!t){std::free(host_offsets);return 0;}
     t->I=I;t->O=O;t->device=device;t->sparse_codec=codec_id;t->sparse_layout=sparse_layout;
     t->sparse_aux_bytes=auxiliary_bytes_per_block;t->sparse_value_bits=retained_value_bits;
-    t->native_sgguf=1;t->sparse_blocks_per_row=I/256;t->owns_weights=1;t->weight_bytes=block_bytes;
+    t->native_sgguf=1;t->sparse_blocks_per_row=(I+255)/256;t->owns_weights=1;t->weight_bytes=block_bytes;
     t->sparse_index_bytes=index_bytes;
     int ok=cuda_ok(cudaMalloc(&t->weights,block_bytes),"SGGUF sparse block allocation")&&
            cuda_ok(cudaMalloc(&t->sparse_offsets,index_bytes),"SGGUF sparse index allocation")&&

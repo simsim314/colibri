@@ -71,6 +71,20 @@ int main(void) {
     assert(coli_ggml_dequantize_row(15,q8k,256,y));
     near(y[0],-2); near(y[16],2); near(y[17],-2);
 
+    uint8_t iq4xs[136] = {0};
+    put_u16(iq4xs,0x3c00); /* d = 1 */
+    put_u16(iq4xs+2,0xaaaa); /* high two scale bits = 2 */
+    for(int i=0;i<4;i++) iq4xs[4+i]=0x11; /* low scale nibble = 1 => 33-32 = 1 */
+    for(int i=0;i<128;i++) iq4xs[8+i]=0xf8;
+    assert(coli_ggml_dequantize_row(23,iq4xs,256,y));
+    near(y[0],1); near(y[15],1); near(y[16],113); near(y[31],113);
+
+    uint8_t mxfp4[17] = {0}; mxfp4[0]=127;
+    for(int i=0;i<16;i++) mxfp4[1+i]=(uint8_t)(7u | (15u<<4));
+    assert(coli_ggml_dequantize_row(39,mxfp4,32,y));
+    near(y[0],6); near(y[15],6); near(y[16],-6); near(y[31],-6);
+    near(coli_dtype_dot_f32(COLI_DTYPE_MXFP4,mxfp4,y,32),1152.0f);
+
     uint64_t changed = 0;
     assert(coli_dtype_zero_below_inplace(COLI_DTYPE_Q6_K, q6k, 256, 33.0f, &changed));
     assert(changed == 256);

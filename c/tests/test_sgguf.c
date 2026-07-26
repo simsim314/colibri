@@ -239,12 +239,113 @@ static int test_bitmap_f32(void) {
     return good;
 }
 
+
+static int test_bitmap_v3_mxfp4_tail(void) {
+    const uint32_t logical = 64;
+    uint8_t bitmap[32] = {0};
+    const uint32_t positions[4] = {0,31,32,63};
+    const uint8_t codes[4] = {1,7,9,15};
+    for (int i=0;i<4;i++) bitmap[positions[i]>>3] |= (uint8_t)(1u<<(positions[i]&7));
+    const uint32_t block_bytes = 32 + 8 + 2;
+    const uint64_t blocks_offset = 88;
+    const uint64_t payload_size = blocks_offset + block_bytes;
+    uint8_t *payload=(uint8_t*)calloc(1,(size_t)payload_size); if(!payload)return 0;
+    memcpy(payload,"SPB3",4); coli_sgguf_store_u32_le(payload+4,3);
+    coli_sgguf_store_u32_le(payload+8,COLI_SGGUF_CODEC_MXFP4_EXACT);
+    coli_sgguf_store_u32_le(payload+12,256); coli_sgguf_store_u32_le(payload+16,logical);
+    coli_sgguf_store_u32_le(payload+20,1); coli_sgguf_store_u32_le(payload+24,1);
+    coli_sgguf_store_u32_le(payload+28,1); coli_sgguf_store_u64_le(payload+32,1);
+    coli_sgguf_store_u64_le(payload+40,1); coli_sgguf_store_u64_le(payload+48,80);
+    coli_sgguf_store_u64_le(payload+56,blocks_offset); coli_sgguf_store_u64_le(payload+64,payload_size);
+    coli_sgguf_store_u16_le(payload+72,8); coli_sgguf_store_u16_le(payload+74,4);
+    coli_sgguf_store_u32_le(payload+80,0); coli_sgguf_store_u32_le(payload+84,block_bytes);
+    uint8_t *b=payload+blocks_offset; memcpy(b,bitmap,32); b[32]=127; b[33]=128;
+    b[40]=(uint8_t)(codes[0]|(codes[1]<<4)); b[41]=(uint8_t)(codes[2]|(codes[3]<<4));
+    ColiSggufSparseTensor t; ColiSggufSparseBlock block; char err[160];
+    int good=coli_sgguf_sparse_tensor_parse(payload,payload_size,&t,err,sizeof(err))&&
+             t.layout==COLI_SGGUF_LAYOUT_BITMAP_V3&&
+             coli_sgguf_sparse_block_get(&t,0,&block,err,sizeof(err))&&block.logical_count==64;
+    float out[256],x[256]; for(int i=0;i<256;i++)x[i]=1.0f;
+    int ok=0; float dot=good?coli_sgguf_sparse_block_dot_f32(&block,x,&ok):0.0f;
+    good=good&&ok&&coli_sgguf_sparse_block_materialize_f32(&block,out);
+    if(good){
+        good=fabsf(out[0]-0.5f)<1e-6f&&fabsf(out[31]-6.0f)<1e-6f&&
+             fabsf(out[32]+1.0f)<1e-6f&&fabsf(out[63]+12.0f)<1e-6f&&
+             fabsf(dot+6.5f)<1e-6f;
+        for(int i=64;i<256&&good;i++) if(out[i]!=0.0f)good=0;
+    }
+    free(payload); return good;
+}
+
+static int test_bitmap_v3_iq4_xs(void) {
+    uint8_t bitmap[32] = {0};
+    const uint32_t positions[4] = {0, 31, 32, 255};
+    const uint8_t codes[4] = {0, 15, 8, 7};
+    for (int i = 0; i < 4; ++i)
+        bitmap[positions[i] >> 3] |= (uint8_t)(1u << (positions[i] & 7));
+
+    const uint32_t block_bytes = 32 + 8 + 2;
+    const uint64_t blocks_offset = 88;
+    const uint64_t payload_size = blocks_offset + block_bytes;
+    uint8_t *payload = (uint8_t *)calloc(1, (size_t)payload_size);
+    if (!payload) return 0;
+    memcpy(payload, "SPB3", 4);
+    coli_sgguf_store_u32_le(payload + 4, 3);
+    coli_sgguf_store_u32_le(payload + 8, COLI_SGGUF_CODEC_IQ4_XS_EXACT);
+    coli_sgguf_store_u32_le(payload + 12, 256);
+    coli_sgguf_store_u32_le(payload + 16, 256);
+    coli_sgguf_store_u32_le(payload + 20, 1);
+    coli_sgguf_store_u32_le(payload + 24, 1);
+    coli_sgguf_store_u32_le(payload + 28, 1);
+    coli_sgguf_store_u64_le(payload + 32, 1);
+    coli_sgguf_store_u64_le(payload + 40, 1);
+    coli_sgguf_store_u64_le(payload + 48, 80);
+    coli_sgguf_store_u64_le(payload + 56, blocks_offset);
+    coli_sgguf_store_u64_le(payload + 64, payload_size);
+    coli_sgguf_store_u16_le(payload + 72, 8);
+    coli_sgguf_store_u16_le(payload + 74, 4);
+    coli_sgguf_store_u32_le(payload + 80, 0);
+    coli_sgguf_store_u32_le(payload + 84, block_bytes);
+
+    uint8_t *b = payload + blocks_offset;
+    memcpy(b, bitmap, 32);
+    /* FP16 d=1.0. Every subgroup scale code is 33, so dl=1.0. */
+    coli_sgguf_store_u16_le(b + 32, 0x3c00);
+    coli_sgguf_store_u16_le(b + 34, 0xaaaa);
+    memset(b + 36, 0x11, 4);
+    b[40] = (uint8_t)(codes[0] | (codes[1] << 4));
+    b[41] = (uint8_t)(codes[2] | (codes[3] << 4));
+
+    ColiSggufSparseTensor t;
+    ColiSggufSparseBlock block;
+    char err[160];
+    int good = coli_sgguf_sparse_tensor_parse(payload, payload_size, &t, err, sizeof(err)) &&
+               t.layout == COLI_SGGUF_LAYOUT_BITMAP_V3 &&
+               coli_sgguf_sparse_block_get(&t, 0, &block, err, sizeof(err));
+    float out[256], x[256];
+    for (int i = 0; i < 256; ++i) x[i] = 1.0f;
+    int ok = 0;
+    float dot = good ? coli_sgguf_sparse_block_dot_f32(&block, x, &ok) : 0.0f;
+    good = good && ok && coli_sgguf_sparse_block_materialize_f32(&block, out);
+    if (good) {
+        good = fabsf(out[0] + 127.0f) < 1e-6f &&
+               fabsf(out[31] - 113.0f) < 1e-6f &&
+               fabsf(out[32] - 1.0f) < 1e-6f &&
+               fabsf(out[255] + 10.0f) < 1e-6f &&
+               fabsf(dot + 23.0f) < 1e-6f;
+    }
+    free(payload);
+    return good;
+}
+
 int main(void) {
     for (int i = 0; i < 5; ++i)
         if (!test_tree_pattern(i)) return fail("tree roundtrip failed");
     if (!test_malformed_tree_rejected()) return fail("malformed tree accepted");
     if (!test_sparse_f32()) return fail("legacy tree F32 block/tensor test failed");
     if (!test_bitmap_f32()) return fail("bitmap F32 block/tensor test failed");
+    if (!test_bitmap_v3_mxfp4_tail()) return fail("SPB3 MXFP4 tail test failed");
+    if (!test_bitmap_v3_iq4_xs()) return fail("SPB3 IQ4_XS test failed");
     puts("test_sgguf: ok");
     return 0;
 }

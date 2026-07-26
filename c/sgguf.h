@@ -27,6 +27,7 @@ typedef enum {
 typedef enum {
     COLI_SGGUF_LAYOUT_TREE_V1 = 1,
     COLI_SGGUF_LAYOUT_BITMAP_V2 = 2,
+    COLI_SGGUF_LAYOUT_BITMAP_V3 = 3,
 } ColiSggufSparseLayout;
 
 /* Sparse payload codecs. The logical GGML tensor type remains in the tensor
@@ -47,6 +48,8 @@ typedef enum {
     COLI_SGGUF_CODEC_Q3_K_EXACT = 12,
     COLI_SGGUF_CODEC_Q5_K_EXACT = 13,
     COLI_SGGUF_CODEC_Q8_K_EXACT = 14,
+    COLI_SGGUF_CODEC_MXFP4_EXACT = 15,
+    COLI_SGGUF_CODEC_IQ4_XS_EXACT = 16,
 } ColiSggufCodecId;
 
 typedef enum {
@@ -88,6 +91,7 @@ typedef struct {
     uint16_t retained_count;
     uint16_t auxiliary_bytes;
     uint16_t retained_value_bits;
+    uint16_t logical_count;               /* 1..256; SPB3 tail groups may be short */
     uint32_t retained_payload_bytes;
     uint32_t encoded_block_bytes;
     const uint8_t *tree;                   /* legacy SPT1 only */

@@ -54,6 +54,8 @@ const char *coli_sgguf_codec_name(uint32_t codec_id) {
         case COLI_SGGUF_CODEC_Q3_K_EXACT: return "q3_k-exact";
         case COLI_SGGUF_CODEC_Q5_K_EXACT: return "q5_k-exact";
         case COLI_SGGUF_CODEC_Q8_K_EXACT: return "q8_k-exact";
+        case COLI_SGGUF_CODEC_MXFP4_EXACT: return "mxfp4-exact";
+        case COLI_SGGUF_CODEC_IQ4_XS_EXACT: return "iq4_xs-exact";
         default: return "unknown";
     }
 }
@@ -71,6 +73,8 @@ uint16_t coli_sgguf_codec_aux_bytes(uint32_t codec_id) {
         case COLI_SGGUF_CODEC_Q5_K_EXACT: return 16;
         case COLI_SGGUF_CODEC_Q6_K_EXACT: return 18;
         case COLI_SGGUF_CODEC_Q8_K_EXACT: return 4;
+        case COLI_SGGUF_CODEC_MXFP4_EXACT: return 8;
+        case COLI_SGGUF_CODEC_IQ4_XS_EXACT: return 8;
         case COLI_SGGUF_CODEC_RETAINED_F16:
         case COLI_SGGUF_CODEC_RETAINED_BF16:
         case COLI_SGGUF_CODEC_RETAINED_F32: return 0;
@@ -84,6 +88,8 @@ uint16_t coli_sgguf_codec_value_bits(uint32_t codec_id) {
         case COLI_SGGUF_CODEC_Q4_0_EXACT:
         case COLI_SGGUF_CODEC_Q4_1_EXACT:
         case COLI_SGGUF_CODEC_Q4_K_EXACT: return 4;
+        case COLI_SGGUF_CODEC_MXFP4_EXACT: return 4;
+        case COLI_SGGUF_CODEC_IQ4_XS_EXACT: return 4;
         case COLI_SGGUF_CODEC_Q5_0_EXACT:
         case COLI_SGGUF_CODEC_Q5_1_EXACT:
         case COLI_SGGUF_CODEC_Q5_K_EXACT: return 5;
@@ -267,6 +273,14 @@ int coli_sgguf_sparse_tensor_parse(const uint8_t *payload, uint64_t payload_size
         t.offset_width = 4;
         t.auxiliary_bytes_per_block = coli_sgguf_load_u16_le(payload + 72);
         t.retained_value_bits = coli_sgguf_load_u16_le(payload + 74);
+    } else if (memcmp(payload, "SPB3", 4) == 0) {
+        uint32_t version = coli_sgguf_load_u32_le(payload + 4);
+        if (version != 3)
+            return sgguf_fail(error, error_size, "unsupported SPB3 version %u", version);
+        t.layout = COLI_SGGUF_LAYOUT_BITMAP_V3;
+        t.offset_width = 4;
+        t.auxiliary_bytes_per_block = coli_sgguf_load_u16_le(payload + 72);
+        t.retained_value_bits = coli_sgguf_load_u16_le(payload + 74);
     } else {
         return sgguf_fail(error, error_size, "bad sparse tensor magic");
     }
@@ -283,16 +297,21 @@ int coli_sgguf_sparse_tensor_parse(const uint8_t *payload, uint64_t payload_size
     uint64_t blocks_offset = coli_sgguf_load_u64_le(payload + 56);
     uint64_t encoded_size = coli_sgguf_load_u64_le(payload + 64);
 
-    if (t.group_size != COLI_SGGUF_GROUP_SIZE || !t.cols || t.cols % t.group_size ||
+    const uint32_t expected_blocks_per_row = t.layout == COLI_SGGUF_LAYOUT_BITMAP_V3
+        ? (t.cols + t.group_size - 1u) / t.group_size
+        : (t.cols / t.group_size);
+    if (t.group_size != COLI_SGGUF_GROUP_SIZE || !t.cols ||
+        (t.layout != COLI_SGGUF_LAYOUT_BITMAP_V3 && t.cols % t.group_size) ||
         !t.rows_per_expert || !t.expert_count ||
         t.total_rows != (uint64_t)t.rows_per_expert * t.expert_count ||
-        t.blocks_per_row != t.cols / t.group_size ||
+        t.blocks_per_row != expected_blocks_per_row ||
         t.total_blocks != t.total_rows * t.blocks_per_row)
         return sgguf_fail(error, error_size, "invalid sparse tensor dimensions/index counts");
     if (encoded_size != payload_size)
         return sgguf_fail(error, error_size, "sparse tensor payload size mismatch");
 
-    if (t.layout == COLI_SGGUF_LAYOUT_BITMAP_V2) {
+    if (t.layout == COLI_SGGUF_LAYOUT_BITMAP_V2 ||
+        t.layout == COLI_SGGUF_LAYOUT_BITMAP_V3) {
         uint16_t expected_aux = coli_sgguf_codec_aux_bytes(t.codec_id);
         uint16_t expected_bits = coli_sgguf_codec_value_bits(t.codec_id);
         if (expected_aux == UINT16_MAX || !expected_bits ||
@@ -338,8 +357,16 @@ int coli_sgguf_sparse_block_get(const ColiSggufSparseTensor *tensor,
     b.layout = tensor->layout;
     b.codec_id = tensor->codec_id;
     b.encoded_block_bytes = (uint32_t)(end - begin);
+    {
+        const uint32_t block_in_row = (uint32_t)(block_index % tensor->blocks_per_row);
+        const uint64_t first_col = (uint64_t)block_in_row * tensor->group_size;
+        uint64_t remain = tensor->cols - first_col;
+        if (remain > tensor->group_size) remain = tensor->group_size;
+        b.logical_count = (uint16_t)remain;
+    }
 
-    if (tensor->layout == COLI_SGGUF_LAYOUT_BITMAP_V2) {
+    if (tensor->layout == COLI_SGGUF_LAYOUT_BITMAP_V2 ||
+        tensor->layout == COLI_SGGUF_LAYOUT_BITMAP_V3) {
         if (end - begin < COLI_SGGUF_BITMAP_BYTES + tensor->auxiliary_bytes_per_block)
             return sgguf_fail(error, error_size, "truncated SPB2 block");
         b.bitmap = p;
@@ -350,6 +377,12 @@ int coli_sgguf_sparse_block_get(const ColiSggufSparseTensor *tensor,
         uint32_t occupancy[8], retained = 0;
         if (!coli_sgguf_bitmap_decode(b.bitmap, occupancy, &retained))
             return sgguf_fail(error, error_size, "invalid SPB2 bitmap");
+        if (b.logical_count < COLI_SGGUF_GROUP_SIZE) {
+            for (uint32_t i = b.logical_count; i < COLI_SGGUF_GROUP_SIZE; ++i) {
+                if (b.bitmap[i >> 3] & (uint8_t)(1u << (i & 7u)))
+                    return sgguf_fail(error, error_size, "SPB3 tail bitmap contains out-of-row value");
+            }
+        }
         b.retained_count = (uint16_t)retained;
         uint64_t value_bytes = ((uint64_t)retained * b.retained_value_bits + 7u) / 8u;
         uint64_t expected = COLI_SGGUF_BITMAP_BYTES + b.auxiliary_bytes + value_bytes;
@@ -393,7 +426,8 @@ int coli_sgguf_sparse_block_get(const ColiSggufSparseTensor *tensor,
 static int sparse_block_occupancy(const ColiSggufSparseBlock *block,
                                   uint32_t occupancy[8], uint32_t *retained) {
     if (!block) return 0;
-    if (block->layout == COLI_SGGUF_LAYOUT_BITMAP_V2)
+    if (block->layout == COLI_SGGUF_LAYOUT_BITMAP_V2 ||
+        block->layout == COLI_SGGUF_LAYOUT_BITMAP_V3)
         return coli_sgguf_bitmap_decode(block->bitmap, occupancy, retained);
     return coli_sgguf_tree_decode(block->tree, block->tree_bits, occupancy, retained);
 }
@@ -534,6 +568,30 @@ static float sparse_value(const ColiSggufSparseBlock *b,
             float d; memcpy(&d, &u, sizeof(d));
             return d * (int8_t)code;
         }
+        case COLI_SGGUF_CODEC_MXFP4_EXACT: {
+            if (b->auxiliary_bytes != 8 || b->retained_value_bits != 4) break;
+            uint32_t native = dense_position >> 5;
+            if (native >= 8u) break;
+            uint32_t code = read_packed_bits(b->retained_values, retained_index * 4u, 4u);
+            return coli_mxfp4_code_to_fp32(b->auxiliary[native], (uint8_t)code);
+        }
+        case COLI_SGGUF_CODEC_IQ4_XS_EXACT: {
+            if (b->auxiliary_bytes != 8 || b->retained_value_bits != 4) break;
+            uint32_t subgroup = dense_position >> 5;
+            if (subgroup >= 8u) break;
+            float d = coli_fp16_to_fp32(coli_sgguf_load_u16_le(b->auxiliary));
+            uint16_t scales_h = coli_sgguf_load_u16_le(b->auxiliary + 2);
+            uint8_t scales_l = b->auxiliary[4u + (subgroup >> 1)];
+            uint32_t low = (scales_l >> (4u * (subgroup & 1u))) & 15u;
+            uint32_t high = (scales_h >> (2u * subgroup)) & 3u;
+            float dl = d * (float)((int)(low | (high << 4)) - 32);
+            uint32_t code = read_packed_bits(b->retained_values, retained_index * 4u, 4u);
+            static const int8_t iq4nl_values[16] = {
+                -127, -104, -83, -65, -49, -35, -22, -10,
+                   1,   13,  25,  38,  53,  69,  89, 113,
+            };
+            return dl * (float)iq4nl_values[code & 15u];
+        }
         default: break;
     }
     if (ok) *ok = 0;
@@ -558,6 +616,8 @@ float coli_sgguf_sparse_block_dot_f32(const ColiSggufSparseBlock *block,
             uint32_t bit = 0; while (((bits >> bit) & 1u) == 0) ++bit;
 #endif
             uint32_t dense = w * 32u + bit;
+            uint32_t logical_count = block->logical_count ? block->logical_count : COLI_SGGUF_GROUP_SIZE;
+            if (dense >= logical_count) return 0.0f;
             int value_ok = 0;
             float value = sparse_value(block, dense, k++, &value_ok);
             if (!value_ok) return 0.0f;
@@ -587,6 +647,8 @@ int coli_sgguf_sparse_block_materialize_f32(const ColiSggufSparseBlock *block,
             uint32_t bit = 0; while (((bits >> bit) & 1u) == 0) ++bit;
 #endif
             uint32_t dense = w * 32u + bit;
+            uint32_t logical_count = block->logical_count ? block->logical_count : COLI_SGGUF_GROUP_SIZE;
+            if (dense >= logical_count) return 0.0f;
             int value_ok = 0;
             output[dense] = sparse_value(block, dense, k++, &value_ok);
             if (!value_ok) return 0;

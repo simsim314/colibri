@@ -1,6 +1,7 @@
 #include "gguf_granite.h"
 #include "gguf_qwen3next.h"
 #include "gguf_qwen35moe.h"
+#include "gguf_gptoss.h"
 #include "tensor.h"
 #include "gguf_tokenizer.h"
 #include "f32_kernels.h"
@@ -785,6 +786,9 @@ int coli_gguf_run_cli(int argc,char**argv){
                 }
                 if(!strcmp(arch,"qwen35moe")){
                     free(arch);coli_gguf_close(&arch_probe);return coli_qwen35moe_run_cli(argc,argv);
+                }
+                if(!strcmp(arch,"gpt-oss")){
+                    free(arch);coli_gguf_close(&arch_probe);return coli_gptoss_run_cli(argc,argv);
                 }
             }
             free(arch);coli_gguf_close(&arch_probe);

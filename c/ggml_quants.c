@@ -19,6 +19,27 @@ static float load_f32(const uint8_t *p) {
     return f;
 }
 
+/* OCP MX E2M1 values are stored doubled in this table. GGML's E8M0
+ * conversion for MXFP4 returns half of the power-of-two block scale. */
+static const int8_t k_mxfp4_values_x2[16] = {
+     0,  1,  2,  3,  4,  6,  8, 12,
+     0, -1, -2, -3, -4, -6, -8,-12,
+};
+
+static const int8_t k_iq4nl_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113,
+};
+
+float coli_e8m0_to_fp32_half(uint8_t e) {
+    if (e == 0xffu) return NAN;
+    return ldexpf(0.5f, (int)e - 127);
+}
+
+float coli_mxfp4_code_to_fp32(uint8_t e, uint8_t code) {
+    return coli_e8m0_to_fp32_half(e) * (float)k_mxfp4_values_x2[code & 15u];
+}
+
 float coli_bf16_to_fp32(uint16_t h) {
     uint32_t u = (uint32_t)h << 16;
     float f;
@@ -201,6 +222,33 @@ static void deq_q8_k(const uint8_t *p, float *y) {
     for (int j = 0; j < 256; ++j) y[j] = d * q[j];
 }
 
+static void deq_iq4_xs(const uint8_t *p, float *y) {
+    const float d = coli_fp16_to_fp32(load_u16(p));
+    const uint16_t scales_h = load_u16(p + 2);
+    const uint8_t *scales_l = p + 4;
+    const uint8_t *q = p + 8;
+    for (uint32_t ib = 0; ib < 8; ++ib) {
+        const uint32_t low = (scales_l[ib >> 1] >> (4u * (ib & 1u))) & 0x0fu;
+        const uint32_t high = (scales_h >> (2u * ib)) & 0x03u;
+        const float dl = d * (float)((int)(low | (high << 4)) - 32);
+        const uint8_t *qb = q + ib * 16u;
+        float *yb = y + ib * 32u;
+        for (uint32_t j = 0; j < 16; ++j) {
+            yb[j] = dl * (float)k_iq4nl_values[qb[j] & 15u];
+            yb[j + 16u] = dl * (float)k_iq4nl_values[qb[j] >> 4];
+        }
+    }
+}
+
+static void deq_mxfp4(const uint8_t *p, float *y) {
+    const uint8_t e = p[0];
+    const uint8_t *q = p + 1;
+    for (uint32_t j = 0; j < 16; ++j) {
+        y[j] = coli_mxfp4_code_to_fp32(e, q[j] & 15u);
+        y[j + 16u] = coli_mxfp4_code_to_fp32(e, q[j] >> 4);
+    }
+}
+
 int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
                               uint64_t element_count, float *output) {
     const ColiDTypeTraits *t = coli_dtype_traits(type);
@@ -227,9 +275,11 @@ int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
             case 13: deq_q5_k(p, y); break;
             case 14: deq_q6_k(p, y); break;
             case 15: deq_q8_k(p, y); break;
+            case 23: deq_iq4_xs(p, y); break;
             case 30:
                 y[0] = coli_bf16_to_fp32(load_u16(p));
                 break;
+            case 39: deq_mxfp4(p, y); break;
             default: return 0;
         }
         p += t->block_bytes;

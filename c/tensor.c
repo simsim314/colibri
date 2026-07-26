@@ -295,10 +295,13 @@ int coli_tensor_read_row_f32(const ColiTensor *tensor, uint64_t row,
                         row * tensor->sparse_tensor.blocks_per_row;
         for (uint32_t b = 0; b < tensor->sparse_tensor.blocks_per_row; ++b) {
             ColiSggufSparseBlock block;
+            float temp[COLI_SGGUF_GROUP_SIZE];
             if (!coli_sgguf_sparse_block_get(&tensor->sparse_tensor, base + b,
                                              &block, NULL, 0) ||
-                !coli_sgguf_sparse_block_materialize_f32(&block,
-                    output + (uint64_t)b * COLI_SGGUF_GROUP_SIZE)) return 0;
+                !coli_sgguf_sparse_block_materialize_f32(&block, temp)) return 0;
+            uint64_t first = (uint64_t)b * COLI_SGGUF_GROUP_SIZE;
+            if (first > tensor->dims[0] || block.logical_count > tensor->dims[0] - first) return 0;
+            memcpy(output + first, temp, (size_t)block.logical_count * sizeof(*temp));
         }
         return 1;
     }
@@ -312,8 +315,9 @@ static int matmul_cpu(float *y, const float *x, const ColiTensor *w,
     if (!y || !x || !w || S < 1 || I < 1 || O < 1 ||
         w->dims[0] != (uint64_t)I || w->row_count != (uint64_t)O) return 0;
     if (w->storage_kind == COLI_TENSOR_STORAGE_SPARSE_TREE) {
-        if (I % (int)COLI_SGGUF_GROUP_SIZE ||
-            w->sparse_tensor.blocks_per_row != (uint32_t)(I / (int)COLI_SGGUF_GROUP_SIZE)) return 0;
+        const uint32_t expected_blocks = ((uint32_t)I + COLI_SGGUF_GROUP_SIZE - 1u) /
+                                         COLI_SGGUF_GROUP_SIZE;
+        if (w->sparse_tensor.blocks_per_row != expected_blocks) return 0;
         int failed = 0;
 #pragma omp parallel for schedule(static) reduction(|:failed)
         for (int o = 0; o < O; ++o) {

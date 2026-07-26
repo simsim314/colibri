@@ -6,6 +6,8 @@
 
 float coli_fp16_to_fp32(uint16_t h);
 float coli_bf16_to_fp32(uint16_t h);
+float coli_e8m0_to_fp32_half(uint8_t e);
+float coli_mxfp4_code_to_fp32(uint8_t e, uint8_t code);
 int coli_dtype_dequantize_row(ColiDType type, const void *encoded,
                               uint64_t element_count, float *output);
 float coli_dtype_dot_f32(ColiDType type, const void *encoded,
