@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,11 +47,26 @@ static int omp_get_max_threads(void) { return 1; }
 
 typedef struct GptOssDebugState GptOssDebugState;
 
+typedef enum {
+    GPTOSS_EXPERT_CACHE_STATS = 0,
+    GPTOSS_EXPERT_CACHE_FIXED = 1,
+} GptOssExpertCacheMode;
+
 typedef struct {
     int eid;
     uint64_t age;
     int cuda_resident;
+    int evictable;
 } GptOssExpertSlot;
+
+typedef struct {
+    int layer;
+    int eid;
+    uint32_t hits;
+    size_t bytes;
+    int already_resident;
+    int selected;
+} GptOssCacheCandidate;
 
 typedef struct {
     ColiTensor attn_norm, post_attn_norm;
@@ -65,6 +81,35 @@ typedef struct {
     GptOssExpertSlot *cache;
     int cache_cap;
 } GptOssLayer;
+
+typedef struct {
+    ColiTensor *tensor;
+    const uint8_t *source;
+    void *buffer;
+    size_t bytes;
+    int original_mmap_backed;
+    int ok;
+} GptOssMmapReadTask;
+
+typedef struct {
+    pthread_t *threads;
+    int thread_count;
+    pthread_mutex_t mutex;
+    pthread_cond_t work_ready;
+    pthread_cond_t work_done;
+    GptOssMmapReadTask *tasks;
+    int task_count;
+    int next_task;
+    int completed;
+    int stopping;
+    int initialized;
+} GptOssMmapReadPool;
+
+typedef struct {
+    GptOssMmapReadTask *tasks;
+    int count;
+    size_t bytes;
+} GptOssMmapReadBatch;
 
 typedef struct {
     ColiGgufFile gguf;
@@ -93,6 +138,14 @@ typedef struct {
     char usage_path[PATH_MAX];
     int64_t usage_history;
     GptOssDebugState *debug;
+    GptOssMmapReadPool mmap_pool;
+    int mmap_readers;
+    size_t expert_cache_budget_bytes;
+    size_t expert_cache_reserve_bytes;
+    size_t expert_cache_loaded_bytes;
+    int expert_cache_count;
+    GptOssExpertCacheMode expert_cache_mode;
+    int expert_cache_fixed_per_layer;
 } GptOssModel;
 
 typedef struct {
@@ -692,9 +745,211 @@ static void layer_free(GptOssModel *m, GptOssLayer *l) {
     tensor_free(&l->gate_bias); tensor_free(&l->up_bias); tensor_free(&l->down_bias);
 }
 
+static void *gptoss_mmap_read_worker(void *opaque) {
+    GptOssMmapReadPool *pool = (GptOssMmapReadPool *)opaque;
+    for (;;) {
+        pthread_mutex_lock(&pool->mutex);
+        while (!pool->stopping &&
+               (!pool->tasks || pool->next_task >= pool->task_count))
+            pthread_cond_wait(&pool->work_ready, &pool->mutex);
+        if (pool->stopping) {
+            pthread_mutex_unlock(&pool->mutex);
+            return NULL;
+        }
+        GptOssMmapReadTask *task = &pool->tasks[pool->next_task++];
+        pthread_mutex_unlock(&pool->mutex);
+
+        memcpy(task->buffer, task->source, task->bytes);
+        task->ok = 1;
+
+        pthread_mutex_lock(&pool->mutex);
+        ++pool->completed;
+        if (pool->completed == pool->task_count)
+            pthread_cond_signal(&pool->work_done);
+        pthread_mutex_unlock(&pool->mutex);
+    }
+}
+
+static int gptoss_mmap_read_pool_init(GptOssMmapReadPool *pool, int readers) {
+    if (!pool || readers <= 0) return 0;
+    memset(pool, 0, sizeof(*pool));
+    if (pthread_mutex_init(&pool->mutex, NULL) != 0) return 0;
+    if (pthread_cond_init(&pool->work_ready, NULL) != 0) {
+        pthread_mutex_destroy(&pool->mutex);
+        return 0;
+    }
+    if (pthread_cond_init(&pool->work_done, NULL) != 0) {
+        pthread_cond_destroy(&pool->work_ready);
+        pthread_mutex_destroy(&pool->mutex);
+        return 0;
+    }
+    pool->threads = (pthread_t *)calloc((size_t)readers, sizeof(*pool->threads));
+    if (!pool->threads) {
+        pthread_cond_destroy(&pool->work_done);
+        pthread_cond_destroy(&pool->work_ready);
+        pthread_mutex_destroy(&pool->mutex);
+        return 0;
+    }
+    pool->initialized = 1;
+    for (int i = 0; i < readers; ++i) {
+        if (pthread_create(&pool->threads[i], NULL,
+                           gptoss_mmap_read_worker, pool) != 0) break;
+        ++pool->thread_count;
+    }
+    if (!pool->thread_count) {
+        free(pool->threads);
+        pthread_cond_destroy(&pool->work_done);
+        pthread_cond_destroy(&pool->work_ready);
+        pthread_mutex_destroy(&pool->mutex);
+        memset(pool, 0, sizeof(*pool));
+    }
+    return pool->thread_count;
+}
+
+static void gptoss_mmap_read_pool_destroy(GptOssMmapReadPool *pool) {
+    if (!pool || !pool->initialized) return;
+    pthread_mutex_lock(&pool->mutex);
+    pool->stopping = 1;
+    pthread_cond_broadcast(&pool->work_ready);
+    pthread_mutex_unlock(&pool->mutex);
+    for (int i = 0; i < pool->thread_count; ++i)
+        pthread_join(pool->threads[i], NULL);
+    free(pool->threads);
+    pthread_cond_destroy(&pool->work_done);
+    pthread_cond_destroy(&pool->work_ready);
+    pthread_mutex_destroy(&pool->mutex);
+    memset(pool, 0, sizeof(*pool));
+}
+
+static void gptoss_mmap_read_pool_run(GptOssMmapReadPool *pool,
+                                      GptOssMmapReadTask *tasks,
+                                      int task_count) {
+    if (!tasks || task_count <= 0) return;
+    if (!pool || !pool->initialized || pool->thread_count <= 0) {
+        for (int i = 0; i < task_count; ++i) {
+            memcpy(tasks[i].buffer, tasks[i].source, tasks[i].bytes);
+            tasks[i].ok = 1;
+        }
+        return;
+    }
+    pthread_mutex_lock(&pool->mutex);
+    pool->tasks = tasks;
+    pool->task_count = task_count;
+    pool->next_task = 0;
+    pool->completed = 0;
+    pthread_cond_broadcast(&pool->work_ready);
+    while (pool->completed < task_count)
+        pthread_cond_wait(&pool->work_done, &pool->mutex);
+    pool->tasks = NULL;
+    pool->task_count = 0;
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+static void gptoss_mmap_readers_configure(GptOssModel *m) {
+    const char *env = getenv("GPTOSS_MMAP_READERS");
+    if (!m || !env || !*env) return;
+    char *end = NULL;
+    long requested = strtol(env, &end, 10);
+    if (end == env || *end || requested <= 0) return;
+    long maximum = 3L * m->top_k;
+    if (requested > maximum) requested = maximum;
+    m->mmap_readers = gptoss_mmap_read_pool_init(
+        &m->mmap_pool, (int)requested);
+    if (m->verbose) {
+        if (m->mmap_readers > 0)
+            fprintf(stderr,
+                "[GPT-OSS] mmap readers=%d (selected gate/up/down disk reads)\n",
+                m->mmap_readers);
+        else
+            fprintf(stderr, "[GPT-OSS] mmap readers unavailable; using direct mmap reads\n");
+    }
+}
+
+static int gptoss_mmap_tensor_candidate(GptOssModel *m, ColiTensor *tensor) {
+    if (!m || m->mmap_readers <= 0 || !tensor ||
+        tensor->storage_kind != COLI_TENSOR_STORAGE_DENSE ||
+        !tensor->data || !tensor->mmap_backed ||
+        tensor->storage_bytes > SIZE_MAX) return 0;
+    if (m->exec.kind == COLI_BACKEND_CUDA &&
+        coli_tensor_is_resident(&m->exec, tensor)) return 0;
+    return tensor->split_location != COLI_SPLIT_PRELOAD_RAM;
+}
+
+static void gptoss_mmap_batch_release(GptOssMmapReadBatch *batch) {
+    if (!batch || !batch->tasks) return;
+    for (int i = 0; i < batch->count; ++i) {
+        GptOssMmapReadTask *task = &batch->tasks[i];
+        if (task->ok) {
+            task->tensor->data = task->source;
+            task->tensor->mmap_backed = task->original_mmap_backed;
+        }
+        free(task->buffer);
+    }
+    free(batch->tasks);
+    memset(batch, 0, sizeof(*batch));
+}
+
+static void gptoss_mmap_materialize_selected(GptOssModel *m,
+                                             GptOssLayer *layer,
+                                             const int *experts,
+                                             int expert_count,
+                                             int layer_index,
+                                             GptOssMmapReadBatch *batch) {
+    if (!batch) return;
+    memset(batch, 0, sizeof(*batch));
+    if (!m || m->mmap_readers <= 0 || !layer || !experts || expert_count <= 0)
+        return;
+    const int capacity = 3 * expert_count;
+    batch->tasks = (GptOssMmapReadTask *)calloc(
+        (size_t)capacity, sizeof(*batch->tasks));
+    if (!batch->tasks) return;
+
+    for (int j = 0; j < expert_count; ++j) {
+        const int eid = experts[j];
+        if (eid < 0 || eid >= m->n_experts) continue;
+        ColiTensor *weights[3] = {
+            &layer->gate_expert[eid],
+            &layer->up_expert[eid],
+            &layer->down_expert[eid],
+        };
+        for (int k = 0; k < 3; ++k) {
+            ColiTensor *tensor = weights[k];
+            if (!gptoss_mmap_tensor_candidate(m, tensor)) continue;
+            GptOssMmapReadTask *task = &batch->tasks[batch->count];
+            task->buffer = malloc((size_t)tensor->storage_bytes);
+            if (!task->buffer) continue;
+            task->tensor = tensor;
+            task->source = tensor->data;
+            task->bytes = (size_t)tensor->storage_bytes;
+            task->original_mmap_backed = tensor->mmap_backed;
+            batch->bytes += task->bytes;
+            ++batch->count;
+        }
+    }
+    if (!batch->count) {
+        free(batch->tasks);
+        batch->tasks = NULL;
+        return;
+    }
+
+    double start = gptoss_debug_clock(m);
+    gptoss_mmap_read_pool_run(&m->mmap_pool, batch->tasks, batch->count);
+    for (int i = 0; i < batch->count; ++i) {
+        GptOssMmapReadTask *task = &batch->tasks[i];
+        if (!task->ok) continue;
+        task->tensor->data = (const uint8_t *)task->buffer;
+        task->tensor->mmap_backed = 0;
+    }
+    if (start)
+        gptoss_debug_op(m, layer_index, -1, "copy",
+                        "expert_mmap_parallel_read", "disk_to_host",
+                        batch->bytes, (now_sec() - start) * 1000.0);
+}
+
 static void model_free(GptOssModel *m) {
     if (!m) return;
     double all0 = gptoss_debug_clock(m);
+    gptoss_mmap_read_pool_destroy(&m->mmap_pool);
     if (m->layers) {
         for (int i = 0; i < m->n_layers; ++i) {
             double t0 = gptoss_debug_clock(m);
@@ -906,22 +1161,14 @@ static int model_load_weights(GptOssModel *m, char *err, size_t cap) {
 }
 
 static int model_build_expert_views(GptOssModel *m, char *err, size_t cap) {
-    int cache_cap = 4;
-    const char *env = getenv("GPTOSS_EXPERT_CACHE_PER_LAYER");
-    if (env && atoi(env) > 0) cache_cap = atoi(env);
-    if (cache_cap < m->top_k) cache_cap = m->top_k;
-    if (cache_cap > m->n_experts) cache_cap = m->n_experts;
     for (int l = 0; l < m->n_layers; ++l) {
         GptOssLayer *x = &m->layers[l];
         x->gate_expert = (ColiTensor *)calloc((size_t)m->n_experts, sizeof(ColiTensor));
         x->up_expert = (ColiTensor *)calloc((size_t)m->n_experts, sizeof(ColiTensor));
         x->down_expert = (ColiTensor *)calloc((size_t)m->n_experts, sizeof(ColiTensor));
         x->usage = (uint32_t *)calloc((size_t)m->n_experts, sizeof(*x->usage));
-        x->cache = (GptOssExpertSlot *)calloc((size_t)cache_cap, sizeof(*x->cache));
-        if (!x->gate_expert || !x->up_expert || !x->down_expert || !x->usage || !x->cache)
+        if (!x->gate_expert || !x->up_expert || !x->down_expert || !x->usage)
             return errf(err, cap, "out of memory allocating GPT-OSS expert views");
-        x->cache_cap = cache_cap;
-        for (int i = 0; i < cache_cap; ++i) x->cache[i].eid = -1;
         for (int e = 0; e < m->n_experts; ++e) {
             const int gate_ok = x->gate_info->storage_kind == COLI_TENSOR_STORAGE_DENSE
                 ? coli_tensor_bind_gguf_rows(&m->gguf, x->gate_info,
@@ -1094,28 +1341,374 @@ static void try_reside_dense_cuda(GptOssModel *m) {
     }
 }
 
+static size_t gptoss_expert_bundle_bytes(const GptOssModel *m, int layer, int eid) {
+    if (!m || layer < 0 || layer >= m->n_layers ||
+        eid < 0 || eid >= m->n_experts) return 0;
+    const GptOssLayer *l = &m->layers[layer];
+    const ColiTensor *tensors[3] = {
+        &l->gate_expert[eid], &l->up_expert[eid], &l->down_expert[eid]
+    };
+    size_t total = 0;
+    for (int i = 0; i < 3; ++i) {
+        uint64_t bytes = tensors[i]->storage_bytes;
+        if (bytes > SIZE_MAX || total > SIZE_MAX - (size_t)bytes) return SIZE_MAX;
+        total += (size_t)bytes;
+    }
+    return total;
+}
+
+static int gptoss_expert_bundle_resident(const GptOssModel *m, int layer, int eid) {
+    if (!m || m->exec.kind != COLI_BACKEND_CUDA ||
+        layer < 0 || layer >= m->n_layers || eid < 0 || eid >= m->n_experts) return 0;
+    const GptOssLayer *l = &m->layers[layer];
+    return coli_tensor_is_resident(&m->exec, &l->gate_expert[eid]) &&
+           coli_tensor_is_resident(&m->exec, &l->up_expert[eid]) &&
+           coli_tensor_is_resident(&m->exec, &l->down_expert[eid]);
+}
+
+static size_t gptoss_parse_mib_env(const char *name, size_t fallback, int *was_set) {
+    const char *text = getenv(name);
+    if (was_set) *was_set = 0;
+    if (!text || !*text) return fallback;
+    char *end = NULL;
+    double mib = strtod(text, &end);
+    if (end == text || *end || !isfinite(mib) || mib < 0.0) return fallback;
+    if (was_set) *was_set = 1;
+    long double bytes = (long double)mib * 1024.0L * 1024.0L;
+    return bytes >= (long double)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
+}
+
+static size_t gptoss_parse_gib_env(const char *name, size_t fallback, int *was_set) {
+    const char *text = getenv(name);
+    if (was_set) *was_set = 0;
+    if (!text || !*text) return fallback;
+    char *end = NULL;
+    double gib = strtod(text, &end);
+    if (end == text || *end || !isfinite(gib) || gib < 0.0) return fallback;
+    if (was_set) *was_set = 1;
+    long double bytes = (long double)gib * 1024.0L * 1024.0L * 1024.0L;
+    return bytes >= (long double)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
+}
+
+static int gptoss_cache_configure(GptOssModel *m, const char *cli_mode,
+                                  int cli_per_layer, char *err, size_t cap) {
+    if (!m) return errf(err, cap, "missing GPT-OSS model for cache configuration");
+    int cli_mode_set = cli_mode && *cli_mode;
+    int cli_count_set = cli_per_layer >= 0;
+    const char *mode = cli_mode_set ? cli_mode
+        : (cli_count_set ? NULL : getenv("GPTOSS_EXPERT_CACHE_MODE"));
+    int per_layer = cli_per_layer;
+    if (!cli_count_set) {
+        const char *text = getenv("GPTOSS_EXPERT_CACHE_PER_LAYER");
+        if (text && *text) {
+            char *end = NULL;
+            long value = strtol(text, &end, 10);
+            if (end == text || *end || value < 0 || value > INT_MAX)
+                return errf(err, cap, "invalid GPTOSS_EXPERT_CACHE_PER_LAYER=%s", text);
+            per_layer = (int)value;
+        }
+    }
+
+    if (!mode || !*mode) {
+        m->expert_cache_mode = per_layer >= 0
+            ? GPTOSS_EXPERT_CACHE_FIXED : GPTOSS_EXPERT_CACHE_STATS;
+    } else if (!strcasecmp(mode, "stats") || !strcasecmp(mode, "greedy")) {
+        m->expert_cache_mode = GPTOSS_EXPERT_CACHE_STATS;
+    } else if (!strcasecmp(mode, "fixed") || !strcasecmp(mode, "lru")) {
+        m->expert_cache_mode = GPTOSS_EXPERT_CACHE_FIXED;
+    } else {
+        return errf(err, cap,
+                    "invalid expert cache mode '%s' (expected stats or fixed)", mode);
+    }
+
+    if (m->expert_cache_mode == GPTOSS_EXPERT_CACHE_FIXED) {
+        if (per_layer < 0) per_layer = m->top_k;
+        if (per_layer > m->n_experts)
+            return errf(err, cap,
+                        "expert cache per layer %d exceeds expert count %d",
+                        per_layer, m->n_experts);
+        m->expert_cache_fixed_per_layer = per_layer;
+    } else {
+        if (cli_count_set && cli_mode_set)
+            return errf(err, cap,
+                        "--expert-cache-per-layer cannot be combined with --expert-cache-mode stats");
+        m->expert_cache_fixed_per_layer = 0;
+    }
+    return 1;
+}
+
+static int gptoss_cache_candidate_compare(const void *va, const void *vb) {
+    const GptOssCacheCandidate *a = (const GptOssCacheCandidate *)va;
+    const GptOssCacheCandidate *b = (const GptOssCacheCandidate *)vb;
+    if (a->already_resident != b->already_resident)
+        return b->already_resident - a->already_resident;
+    if (a->bytes == 0 || b->bytes == 0) {
+        if (a->bytes == 0 && b->bytes != 0) return -1;
+        if (b->bytes == 0 && a->bytes != 0) return 1;
+    } else {
+        long double left = (long double)a->hits * (long double)b->bytes;
+        long double right = (long double)b->hits * (long double)a->bytes;
+        if (left > right) return -1;
+        if (left < right) return 1;
+    }
+    if (a->hits != b->hits) return a->hits > b->hits ? -1 : 1;
+    if (a->bytes != b->bytes) return a->bytes < b->bytes ? -1 : 1;
+    if (a->layer != b->layer) return a->layer < b->layer ? -1 : 1;
+    return a->eid < b->eid ? -1 : a->eid > b->eid;
+}
+
+static int gptoss_cache_select_greedy(GptOssCacheCandidate *items, int count,
+                                      size_t budget, size_t *selected_bytes) {
+    if (selected_bytes) *selected_bytes = 0;
+    if (!items || count <= 0) return 0;
+    qsort(items, (size_t)count, sizeof(*items), gptoss_cache_candidate_compare);
+    size_t used = 0;
+    int selected = 0;
+    for (int i = 0; i < count; ++i) {
+        GptOssCacheCandidate *item = &items[i];
+        item->selected = 0;
+        if (item->already_resident || item->bytes == 0) {
+            item->selected = 1;
+        } else if (item->hits && item->bytes <= budget - used) {
+            item->selected = 1;
+            used += item->bytes;
+        }
+        selected += item->selected;
+    }
+    if (selected_bytes) *selected_bytes = used;
+    return selected;
+}
+
+static int gptoss_cache_upload_bundle(GptOssModel *m, int layer, int eid) {
+    GptOssLayer *l = &m->layers[layer];
+    int gate_prior = coli_tensor_is_resident(&m->exec, &l->gate_expert[eid]);
+    int up_prior = coli_tensor_is_resident(&m->exec, &l->up_expert[eid]);
+    int down_prior = coli_tensor_is_resident(&m->exec, &l->down_expert[eid]);
+    int ignored = 0;
+    int gate_ok = gptoss_reside_profile(m, &l->gate_expert[eid], layer, eid,
+                                        "stats_cache_gate_upload", &ignored);
+    int up_ok = gptoss_reside_profile(m, &l->up_expert[eid], layer, eid,
+                                      "stats_cache_up_upload", &ignored);
+    int down_ok = gptoss_reside_profile(m, &l->down_expert[eid], layer, eid,
+                                        "stats_cache_down_upload", &ignored);
+    if (gate_ok && up_ok && down_ok) return 1;
+    if (!gate_prior) gptoss_release_profile(m, &l->gate_expert[eid], layer, eid,
+                                            "stats_cache_gate_failed_release");
+    if (!up_prior) gptoss_release_profile(m, &l->up_expert[eid], layer, eid,
+                                          "stats_cache_up_failed_release");
+    if (!down_prior) gptoss_release_profile(m, &l->down_expert[eid], layer, eid,
+                                            "stats_cache_down_failed_release");
+    return 0;
+}
+
+static int gptoss_cache_plan_from_usage(GptOssModel *m, char *err, size_t cap) {
+    if (!m || m->exec.kind != COLI_BACKEND_CUDA) return 1;
+#ifdef COLI_CUDA
+    size_t free_bytes = 0, total_bytes = 0;
+    if (!coli_cuda_mem_info(m->exec.device, &free_bytes, &total_bytes))
+        return errf(err, cap, "cannot query CUDA memory for GPT-OSS expert cache");
+
+    size_t reserve = gptoss_parse_mib_env("GPTOSS_EXPERT_CACHE_RESERVE_MIB",
+                                          384u * 1024u * 1024u, NULL);
+    int global_reserve_set = 0;
+    size_t global_reserve = gptoss_parse_gib_env("CUDA_RESERVE_GB", 0, &global_reserve_set);
+    if (global_reserve_set && global_reserve > reserve) reserve = global_reserve;
+    m->expert_cache_reserve_bytes = reserve;
+
+    size_t budget = free_bytes > reserve ? free_bytes - reserve : 0;
+    int budget_set = 0;
+    size_t manual_budget = gptoss_parse_mib_env("GPTOSS_EXPERT_CACHE_MIB", 0, &budget_set);
+    if (budget_set && manual_budget < budget) budget = manual_budget;
+    m->expert_cache_budget_bytes = budget;
+
+    if (m->n_layers <= 0 || m->n_experts <= 0 ||
+        (size_t)m->n_layers > SIZE_MAX / (size_t)m->n_experts)
+        return errf(err, cap, "invalid GPT-OSS expert-cache geometry");
+    size_t candidate_count_z = (size_t)m->n_layers * (size_t)m->n_experts;
+    if (candidate_count_z > INT_MAX || candidate_count_z > SIZE_MAX / sizeof(GptOssCacheCandidate))
+        return errf(err, cap, "GPT-OSS expert-cache candidate overflow");
+    int candidate_count = (int)candidate_count_z;
+    GptOssCacheCandidate *items = (GptOssCacheCandidate *)calloc(
+        candidate_count_z, sizeof(*items));
+    int *planned_per_layer = (int *)calloc((size_t)m->n_layers, sizeof(*planned_per_layer));
+    int *filled_per_layer = (int *)calloc((size_t)m->n_layers, sizeof(*filled_per_layer));
+    if (!items || !planned_per_layer || !filled_per_layer) {
+        free(items); free(planned_per_layer); free(filled_per_layer);
+        return errf(err, cap, "out of memory planning GPT-OSS stats cache");
+    }
+
+    int ci = 0;
+    for (int l = 0; l < m->n_layers; ++l) {
+        for (int e = 0; e < m->n_experts; ++e) {
+            GptOssCacheCandidate *item = &items[ci++];
+            item->layer = l;
+            item->eid = e;
+            item->hits = m->layers[l].usage[e];
+            item->already_resident = gptoss_expert_bundle_resident(m, l, e);
+            item->bytes = item->already_resident ? 0 : gptoss_expert_bundle_bytes(m, l, e);
+        }
+    }
+
+    size_t planned_bytes = 0;
+    uint64_t selected_hits = 0;
+    int planned = gptoss_cache_select_greedy(items, candidate_count, budget, &planned_bytes);
+    for (int i = 0; i < candidate_count; ++i) {
+        if (!items[i].selected) continue;
+        ++planned_per_layer[items[i].layer];
+        selected_hits += items[i].hits;
+    }
+
+    for (int l = 0; l < m->n_layers; ++l) {
+        GptOssLayer *layer = &m->layers[l];
+        free(layer->cache);
+        layer->cache = NULL;
+        layer->cache_cap = 0;
+        if (!planned_per_layer[l]) continue;
+        layer->cache = (GptOssExpertSlot *)calloc(
+            (size_t)planned_per_layer[l], sizeof(*layer->cache));
+        if (!layer->cache) {
+            free(items); free(planned_per_layer); free(filled_per_layer);
+            return errf(err, cap, "out of memory allocating GPT-OSS stats cache slots");
+        }
+        for (int i = 0; i < planned_per_layer[l]; ++i) layer->cache[i].eid = -1;
+    }
+
+    size_t loaded_bytes = 0;
+    int loaded = 0;
+    for (int i = 0; i < candidate_count; ++i) {
+        GptOssCacheCandidate *item = &items[i];
+        if (!item->selected) continue;
+        if (!item->already_resident && !item->hits) continue;
+        if (!gptoss_cache_upload_bundle(m, item->layer, item->eid)) continue;
+        GptOssLayer *layer = &m->layers[item->layer];
+        int slot_index = filled_per_layer[item->layer]++;
+        GptOssExpertSlot *slot = &layer->cache[slot_index];
+        slot->eid = item->eid;
+        slot->age = ++m->cache_clock;
+        slot->cuda_resident = 1;
+        slot->evictable = !item->already_resident;
+        ++loaded;
+        if (!item->already_resident && loaded_bytes <= SIZE_MAX - item->bytes)
+            loaded_bytes += item->bytes;
+    }
+    for (int l = 0; l < m->n_layers; ++l)
+        m->layers[l].cache_cap = filled_per_layer[l];
+
+    m->expert_cache_count = loaded;
+    m->expert_cache_loaded_bytes = loaded_bytes;
+    int min_layer = m->n_experts, max_layer = 0;
+    for (int l = 0; l < m->n_layers; ++l) {
+        if (filled_per_layer[l] < min_layer) min_layer = filled_per_layer[l];
+        if (filled_per_layer[l] > max_layer) max_layer = filled_per_layer[l];
+    }
+    if (m->verbose || loaded || m->usage_history) {
+        double coverage = m->usage_history > 0
+            ? 100.0 * (double)selected_hits / (double)m->usage_history : 0.0;
+        fprintf(stderr,
+            "[GPT-OSS] stats GPU cache: %d experts, %.2f MiB loaded / %.2f MiB budget; per-layer=%d..%d; history=%lld coverage=%.1f%%\n",
+            loaded, loaded_bytes / (1024.0 * 1024.0),
+            budget / (1024.0 * 1024.0), min_layer, max_layer,
+            (long long)m->usage_history, coverage);
+        if (!m->usage_history)
+            fprintf(stderr,
+                "[GPT-OSS] stats GPU cache has no history yet; run once to collect routing statistics\n");
+    }
+    if (m->verbose) {
+        fprintf(stderr, "[GPT-OSS] stats cache slots by layer:");
+        for (int l = 0; l < m->n_layers; ++l)
+            fprintf(stderr, "%s%d", l ? "," : " ", filled_per_layer[l]);
+        fputc('\n', stderr);
+    }
+    if (m->debug && m->debug->enabled)
+        gptoss_debug_emit(m,
+            "event=stats_cache_plan|history=%lld|selected_hits=%llu|free_bytes=%zu|total_bytes=%zu|reserve_bytes=%zu|budget_bytes=%zu|planned=%d|planned_bytes=%zu|loaded=%d|loaded_bytes=%zu|layer_min=%d|layer_max=%d",
+            (long long)m->usage_history, (unsigned long long)selected_hits,
+            free_bytes, total_bytes, reserve, budget,
+            planned, planned_bytes, loaded, loaded_bytes, min_layer, max_layer);
+
+    free(items); free(planned_per_layer); free(filled_per_layer);
+    return 1;
+#else
+    (void)err; (void)cap;
+    return 1;
+#endif
+}
+
+static int gptoss_cache_plan_fixed(GptOssModel *m, char *err, size_t cap) {
+    if (!m) return errf(err, cap, "missing GPT-OSS model for fixed cache");
+    int per_layer = m->expert_cache_fixed_per_layer;
+    if (per_layer < 0 || per_layer > m->n_experts)
+        return errf(err, cap, "invalid fixed expert cache size %d", per_layer);
+    for (int l = 0; l < m->n_layers; ++l) {
+        GptOssLayer *layer = &m->layers[l];
+        free(layer->cache);
+        layer->cache = NULL;
+        layer->cache_cap = 0;
+        if (!per_layer) continue;
+        layer->cache = (GptOssExpertSlot *)calloc(
+            (size_t)per_layer, sizeof(*layer->cache));
+        if (!layer->cache)
+            return errf(err, cap,
+                        "out of memory allocating fixed GPT-OSS cache slots");
+        layer->cache_cap = per_layer;
+        for (int i = 0; i < per_layer; ++i) {
+            layer->cache[i].eid = -1;
+            layer->cache[i].evictable = 1;
+        }
+    }
+    m->expert_cache_count = 0;
+    m->expert_cache_budget_bytes = 0;
+    m->expert_cache_loaded_bytes = 0;
+    if (m->verbose)
+        fprintf(stderr,
+            "[GPT-OSS] fixed GPU cache: %d slots/layer, %d total; runtime LRU uploads\n",
+            per_layer, per_layer * m->n_layers);
+    if (m->debug && m->debug->enabled)
+        gptoss_debug_emit(m,
+            "event=fixed_cache_plan|per_layer=%d|total_slots=%d",
+            per_layer, per_layer * m->n_layers);
+    return 1;
+}
+
+static int gptoss_cache_plan(GptOssModel *m, char *err, size_t cap) {
+    return m->expert_cache_mode == GPTOSS_EXPERT_CACHE_FIXED
+        ? gptoss_cache_plan_fixed(m, err, cap)
+        : gptoss_cache_plan_from_usage(m, err, cap);
+}
+
+static int gptoss_cache_replacement_fits(GptOssModel *m, size_t old_bytes,
+                                         size_t new_bytes) {
+    if (new_bytes <= old_bytes) return 1;
+#ifdef COLI_CUDA
+    size_t free_bytes = 0, total_bytes = 0;
+    if (!coli_cuda_mem_info(m->exec.device, &free_bytes, &total_bytes)) return 0;
+    size_t delta = new_bytes - old_bytes;
+    return free_bytes > m->expert_cache_reserve_bytes &&
+           delta <= free_bytes - m->expert_cache_reserve_bytes;
+#else
+    (void)m; (void)old_bytes; (void)new_bytes;
+    return 0;
+#endif
+}
+
 static GptOssExpertSlot *expert_acquire(GptOssModel *m, int layer, int eid,
                                         GptOssDebugExpertRecord *er) {
     GptOssLayer *l = &m->layers[layer];
     int resident_before = gptoss_debug_layer_resident(l);
-    if (er) { er->resident_before = resident_before; er->eid = eid; }
+    if (er) {
+        er->resident_before = resident_before;
+        er->resident_after = resident_before;
+        er->eid = eid;
+        er->cache_slot = -1;
+        er->evicted_eid = -1;
+    }
     for (int i = 0; i < l->cache_cap; ++i) if (l->cache[i].eid == eid) {
         GptOssExpertSlot *slot = &l->cache[i];
         int hit_was_cuda = slot->cuda_resident;
         if (er) { er->cache_hit = 1; er->cache_slot = i; }
         slot->age = ++m->cache_clock;
-        if (m->exec.kind == COLI_BACKEND_CUDA && !slot->cuda_resident) {
-            int a=0,b=0,c=0;
-            if (gptoss_reside_profile(m, &l->gate_expert[eid], layer, eid, "expert_gate_upload", &a) &&
-                gptoss_reside_profile(m, &l->up_expert[eid], layer, eid, "expert_up_upload", &b) &&
-                gptoss_reside_profile(m, &l->down_expert[eid], layer, eid, "expert_down_upload", &c)) {
-                slot->cuda_resident = 1;
-            } else {
-                gptoss_release_profile(m, &l->gate_expert[eid], layer, eid, "expert_gate_failed_release");
-                gptoss_release_profile(m, &l->up_expert[eid], layer, eid, "expert_up_failed_release");
-                gptoss_release_profile(m, &l->down_expert[eid], layer, eid, "expert_down_failed_release");
-            }
-        }
+        if (m->exec.kind == COLI_BACKEND_CUDA && !slot->cuda_resident)
+            slot->cuda_resident = gptoss_cache_upload_bundle(m, layer, eid);
         if (er) er->resident_after = gptoss_debug_layer_resident(l);
         if (m->debug && m->debug->enabled)
             gptoss_debug_emit(m,
@@ -1126,42 +1719,143 @@ static GptOssExpertSlot *expert_acquire(GptOssModel *m, int layer, int eid,
                 layer, eid, i, hit_was_cuda ? "cuda+host" : "host",
                 slot->cuda_resident ? "cuda+host" : "host", resident_before,
                 gptoss_debug_layer_resident(l));
+        return slot->cuda_resident ? slot : NULL;
+    }
+
+    if (!l->cache || l->cache_cap <= 0 || m->exec.kind != COLI_BACKEND_CUDA) {
+        if (m->debug && m->debug->enabled)
+            gptoss_debug_emit(m,
+                "event=expert_acquire|phase=%s|token_seq=%lld|pos=%d|layer=%d|expert=%d|cache=bypass|reason=no_cache_slot|layer_cuda_before=%d|layer_cuda_after=%d",
+                m->debug->current ? gptoss_debug_phase(m->debug->current) : "startup",
+                m->debug->current ? (long long)m->debug->current->seq : -1LL,
+                m->debug->current ? m->debug->current->pos : -1,
+                layer, eid, resident_before, resident_before);
+        return NULL;
+    }
+
+    if (m->expert_cache_mode == GPTOSS_EXPERT_CACHE_FIXED) {
+        int pick = 0;
+        for (int i = 0; i < l->cache_cap; ++i) {
+            if (l->cache[i].eid < 0) { pick = i; break; }
+            if (l->cache[i].age < l->cache[pick].age) pick = i;
+        }
+        GptOssExpertSlot *slot = &l->cache[pick];
+        int old = slot->eid;
+        if (er) {
+            er->cache_hit = 0;
+            er->cache_slot = pick;
+            er->evicted_eid = old;
+        }
+        if (old >= 0 && slot->cuda_resident) {
+            gptoss_release_profile(m, &l->gate_expert[old], layer, old,
+                                   "fixed_evict_gate_release");
+            gptoss_release_profile(m, &l->up_expert[old], layer, old,
+                                   "fixed_evict_up_release");
+            gptoss_release_profile(m, &l->down_expert[old], layer, old,
+                                   "fixed_evict_down_release");
+        }
+        slot->eid = eid;
+        slot->age = ++m->cache_clock;
+        slot->evictable = 1;
+        slot->cuda_resident = gptoss_cache_upload_bundle(m, layer, eid);
+        if (!slot->cuda_resident) {
+            slot->eid = -1;
+            if (er) er->cache_slot = -1;
+            return NULL;
+        }
+        if (er) er->resident_after = gptoss_debug_layer_resident(l);
+        if (m->debug && m->debug->enabled)
+            gptoss_debug_emit(m,
+                "event=expert_acquire|phase=%s|token_seq=%lld|pos=%d|layer=%d|expert=%d|cache=fixed_lru|slot=%d|evicted=%d|layer_cuda_before=%d|layer_cuda_after=%d",
+                m->debug->current ? gptoss_debug_phase(m->debug->current) : "startup",
+                m->debug->current ? (long long)m->debug->current->seq : -1LL,
+                m->debug->current ? m->debug->current->pos : -1,
+                layer, eid, pick, old, resident_before,
+                gptoss_debug_layer_resident(l));
         return slot;
     }
-    int pick = 0;
+
+    int pick = -1;
+    uint32_t cold_hits = UINT32_MAX;
     for (int i = 0; i < l->cache_cap; ++i) {
-        if (l->cache[i].eid < 0) { pick = i; break; }
-        if (l->cache[i].age < l->cache[pick].age) pick = i;
+        if (!l->cache[i].evictable) continue;
+        int cached_eid = l->cache[i].eid;
+        uint32_t hits = cached_eid >= 0 && cached_eid < m->n_experts
+            ? l->usage[cached_eid] : 0;
+        if (pick < 0 || hits < cold_hits ||
+            (hits == cold_hits && l->cache[i].age < l->cache[pick].age)) {
+            pick = i;
+            cold_hits = hits;
+        }
     }
+    uint32_t new_hits = l->usage[eid];
+    if (pick < 0 || new_hits <= cold_hits) {
+        if (m->debug && m->debug->enabled)
+            gptoss_debug_emit(m,
+                "event=expert_acquire|phase=%s|token_seq=%lld|pos=%d|layer=%d|expert=%d|cache=bypass|reason=colder_than_stats_cache|new_hits=%u|cold_hits=%u|layer_cuda_before=%d|layer_cuda_after=%d",
+                m->debug->current ? gptoss_debug_phase(m->debug->current) : "startup",
+                m->debug->current ? (long long)m->debug->current->seq : -1LL,
+                m->debug->current ? m->debug->current->pos : -1,
+                layer, eid, new_hits, cold_hits, resident_before, resident_before);
+        return NULL;
+    }
+
     GptOssExpertSlot *slot = &l->cache[pick];
     int old = slot->eid;
+    size_t old_bytes = old >= 0 ? gptoss_expert_bundle_bytes(m, layer, old) : 0;
+    size_t new_bytes = gptoss_expert_bundle_bytes(m, layer, eid);
+    if (!gptoss_cache_replacement_fits(m, old_bytes, new_bytes)) {
+        if (m->debug && m->debug->enabled)
+            gptoss_debug_emit(m,
+                "event=expert_acquire|phase=%s|token_seq=%lld|pos=%d|layer=%d|expert=%d|cache=bypass|reason=larger_bundle|new_hits=%u|cold_hits=%u|old_bytes=%zu|new_bytes=%zu",
+                m->debug->current ? gptoss_debug_phase(m->debug->current) : "startup",
+                m->debug->current ? (long long)m->debug->current->seq : -1LL,
+                m->debug->current ? m->debug->current->pos : -1,
+                layer, eid, new_hits, cold_hits, old_bytes, new_bytes);
+        return NULL;
+    }
+
     if (er) { er->cache_hit = 0; er->cache_slot = pick; er->evicted_eid = old; }
     if (old >= 0 && slot->cuda_resident) {
-        gptoss_release_profile(m, &l->gate_expert[old], layer, old, "evict_gate_release");
-        gptoss_release_profile(m, &l->up_expert[old], layer, old, "evict_up_release");
-        gptoss_release_profile(m, &l->down_expert[old], layer, old, "evict_down_release");
+        gptoss_release_profile(m, &l->gate_expert[old], layer, old, "stats_evict_gate_release");
+        gptoss_release_profile(m, &l->up_expert[old], layer, old, "stats_evict_up_release");
+        gptoss_release_profile(m, &l->down_expert[old], layer, old, "stats_evict_down_release");
     }
-    slot->eid = eid; slot->age = ++m->cache_clock; slot->cuda_resident = 0;
-    if (m->exec.kind == COLI_BACKEND_CUDA) {
-        int a=0,b=0,c=0;
-        if (gptoss_reside_profile(m, &l->gate_expert[eid], layer, eid, "expert_gate_upload", &a) &&
-            gptoss_reside_profile(m, &l->up_expert[eid], layer, eid, "expert_up_upload", &b) &&
-            gptoss_reside_profile(m, &l->down_expert[eid], layer, eid, "expert_down_upload", &c)) slot->cuda_resident = 1;
-        else {
-            gptoss_release_profile(m, &l->gate_expert[eid], layer, eid, "expert_gate_failed_release");
-            gptoss_release_profile(m, &l->up_expert[eid], layer, eid, "expert_up_failed_release");
-            gptoss_release_profile(m, &l->down_expert[eid], layer, eid, "expert_down_failed_release");
+    slot->eid = eid;
+    slot->age = ++m->cache_clock;
+    slot->evictable = 1;
+    slot->cuda_resident = gptoss_cache_upload_bundle(m, layer, eid);
+    if (!slot->cuda_resident) {
+        slot->eid = old;
+        slot->age = ++m->cache_clock;
+        slot->evictable = 1;
+        slot->cuda_resident = old >= 0 && gptoss_cache_upload_bundle(m, layer, old);
+        if (er) {
+            er->cache_slot = -1;
+            er->evicted_eid = -1;
+            er->resident_after = gptoss_debug_layer_resident(l);
         }
+        return NULL;
+    }
+
+    if (new_bytes >= old_bytes) {
+        size_t delta = new_bytes - old_bytes;
+        if (m->expert_cache_loaded_bytes <= SIZE_MAX - delta)
+            m->expert_cache_loaded_bytes += delta;
+    } else {
+        size_t delta = old_bytes - new_bytes;
+        m->expert_cache_loaded_bytes = m->expert_cache_loaded_bytes > delta
+            ? m->expert_cache_loaded_bytes - delta : 0;
     }
     if (er) er->resident_after = gptoss_debug_layer_resident(l);
     if (m->debug && m->debug->enabled)
         gptoss_debug_emit(m,
-            "event=expert_acquire|phase=%s|token_seq=%lld|pos=%d|layer=%d|expert=%d|cache=miss|slot=%d|evicted=%d|before=host|after=%s|layer_cuda_before=%d|layer_cuda_after=%d",
+            "event=expert_acquire|phase=%s|token_seq=%lld|pos=%d|layer=%d|expert=%d|cache=stats_replace|slot=%d|evicted=%d|new_hits=%u|old_hits=%u|layer_cuda_before=%d|layer_cuda_after=%d",
             m->debug->current ? gptoss_debug_phase(m->debug->current) : "startup",
             m->debug->current ? (long long)m->debug->current->seq : -1LL,
             m->debug->current ? m->debug->current->pos : -1,
-            layer, eid, pick, old, slot->cuda_resident ? "cuda+host" : "host",
-            resident_before, gptoss_debug_layer_resident(l));
+            layer, eid, pick, old, new_hits, cold_hits, resident_before,
+            gptoss_debug_layer_resident(l));
     return slot;
 }
 
@@ -1508,6 +2202,9 @@ static int model_forward(GptOssModel *m, GptOssScratch *s, int token, int pos,
             fputc('\n', stderr);
         }
 
+        GptOssMmapReadBatch mmap_batch = {0};
+        gptoss_mmap_materialize_selected(m, L, s->top_idx, nk, l, &mmap_batch);
+
         op0 = gptoss_debug_clock(m);
         memset(s->moe, 0, (size_t)m->hidden * sizeof(float));
         if (op0) gptoss_debug_op(m, l, -1, "copy", "moe_zero", "host", (size_t)m->hidden * sizeof(float),
@@ -1533,8 +2230,10 @@ static int model_forward(GptOssModel *m, GptOssScratch *s, int token, int pos,
                 !tensor_row_profile(m, &L->gate_bias, (uint64_t)e, s->gate_bias, m->expert_ff,
                                     l, e, "expert_gate_bias_read", err, cap) ||
                 !tensor_row_profile(m, &L->up_bias, (uint64_t)e, s->up_bias, m->expert_ff,
-                                    l, e, "expert_up_bias_read", err, cap))
+                                    l, e, "expert_up_bias_read", err, cap)) {
+                gptoss_mmap_batch_release(&mmap_batch);
                 return 0;
+            }
             op0 = gptoss_debug_clock(m);
             for (int i = 0; i < m->expert_ff; ++i)
                 s->hidden[i] = coli_gptoss_oai_swiglu(s->gate[i] + s->gate_bias[i], s->up[i] + s->up_bias[i]);
@@ -1543,8 +2242,10 @@ static int model_forward(GptOssModel *m, GptOssScratch *s, int token, int pos,
             if (!tensor_mm_profile(m, s->expert_out, s->hidden, &L->down_expert[e], m->expert_ff, m->hidden, 0,
                                    l, e, "expert_down_matmul", !use_cuda, &down_cuda, err, cap) ||
                 !tensor_row_profile(m, &L->down_bias, (uint64_t)e, s->down_bias, m->hidden,
-                                    l, e, "expert_down_bias_read", err, cap))
+                                    l, e, "expert_down_bias_read", err, cap)) {
+                gptoss_mmap_batch_release(&mmap_batch);
                 return 0;
+            }
             float rw = s->top_w[j];
             op0 = gptoss_debug_clock(m);
             for (int i = 0; i < m->hidden; ++i) s->moe[i] += rw * (s->expert_out[i] + s->down_bias[i]);
@@ -1559,6 +2260,7 @@ static int model_forward(GptOssModel *m, GptOssScratch *s, int token, int pos,
                     use_cuda ? "cuda" : "cpu", er->copied_bytes,
                     er->copy_ms, er->run_ms, er->free_ms);
         }
+        gptoss_mmap_batch_release(&mmap_batch);
         op0 = gptoss_debug_clock(m);
         for (int i = 0; i < m->hidden; ++i) s->x[i] += s->moe[i];
         if (op0) gptoss_debug_op(m, l, -1, "run", "moe_residual_add", "cpu", 0,
@@ -1617,6 +2319,7 @@ static int model_forward(GptOssModel *m, GptOssScratch *s, int token, int pos,
 static int load_model_with_usage_debug(GptOssModel *m, const char *path, const char *usage_file,
                                        int context, int verbose, ColiExec exec,
                                        int debug, const char *debug_dir,
+                                       const char *cache_mode, int cache_per_layer,
                                        char *err, size_t cap) {
     memset(m, 0, sizeof(*m)); m->gguf.fd = -1; m->verbose = verbose; m->exec = exec;
     if (!gptoss_debug_init(m, debug, debug_dir, path, err, cap)) return 0;
@@ -1631,6 +2334,7 @@ static int load_model_with_usage_debug(GptOssModel *m, const char *path, const c
 
     t0 = gptoss_debug_clock(m);
     if (!model_config(m, err, cap)) return 0;
+    if (!gptoss_cache_configure(m, cache_mode, cache_per_layer, err, cap)) return 0;
     if (t0) gptoss_debug_op(m, -1, -1, "alloc", "model_config", "host", 0,
                             (now_sec() - t0) * 1000.0);
 
@@ -1646,8 +2350,10 @@ static int load_model_with_usage_debug(GptOssModel *m, const char *path, const c
 
     t0 = gptoss_debug_clock(m);
     if (!model_build_expert_views(m, err, cap)) return 0;
-    if (t0) gptoss_debug_op(m, -1, -1, "alloc", "build_expert_views_and_cache", "host", 0,
+    if (t0) gptoss_debug_op(m, -1, -1, "alloc", "build_expert_views", "host", 0,
                             (now_sec() - t0) * 1000.0);
+
+    gptoss_mmap_readers_configure(m);
 
     if (!gptoss_usage_configure(m, path, usage_file, err, cap)) return 0;
 
@@ -1671,15 +2377,24 @@ static int load_model_with_usage_debug(GptOssModel *m, const char *path, const c
     fprintf(stderr,
         "[USAGE] GPT-OSS path=%s loaded=%lld selections\n",
         m->usage_path, (long long)history);
+
+    t0 = gptoss_debug_clock(m);
+    if (!gptoss_cache_plan(m, err, cap)) return 0;
+    if (t0) gptoss_debug_op(m, -1, -1, "alloc", "expert_cache_plan", "host+cuda",
+                            m->expert_cache_loaded_bytes,
+                            (now_sec() - t0) * 1000.0);
+
     if (verbose) fprintf(stderr,
         "[GPT-OSS] layers=%d hidden=%d q=%d kv=%d heads=%d/%d experts=%d top=%d ff=%d vocab=%d context=%d backend=%s\n",
         m->n_layers,m->hidden,m->q_dim,m->kv_dim,m->n_heads,m->n_kv_heads,m->n_experts,m->top_k,
         m->expert_ff,m->vocab,context,exec.kind==COLI_BACKEND_CUDA?"cuda-hybrid":"cpu");
     if (m->debug && m->debug->enabled)
         gptoss_debug_emit(m,
-            "event=model_ready|layers=%d|experts_per_layer=%d|top_k=%d|cache_per_layer=%d|context=%d|dense_cuda_bytes=%zu|usage_history=%lld",
+            "event=model_ready|layers=%d|experts_per_layer=%d|top_k=%d|cache_mode=%s|cache_experts=%d|cache_budget_bytes=%zu|cache_loaded_bytes=%zu|context=%d|dense_cuda_bytes=%zu|usage_history=%lld",
             m->n_layers, m->n_experts, m->top_k,
-            m->n_layers ? m->layers[0].cache_cap : 0, context,
+            m->expert_cache_mode == GPTOSS_EXPERT_CACHE_FIXED ? "fixed" : "stats",
+            m->expert_cache_count, m->expert_cache_budget_bytes,
+            m->expert_cache_loaded_bytes, context,
             m->cuda_dense_bytes, (long long)history);
     return 1;
 }
@@ -1687,7 +2402,7 @@ static int load_model_with_usage_debug(GptOssModel *m, const char *path, const c
 static int load_model_with_usage(GptOssModel *m, const char *path, const char *usage_file,
                                  int context, int verbose, ColiExec exec, char *err, size_t cap) {
     return load_model_with_usage_debug(m, path, usage_file, context, verbose, exec,
-                                       0, NULL, err, cap);
+                                       0, NULL, NULL, -1, err, cap);
 }
 
 /* Keep the original internal API used by tests and embedders. */
@@ -1706,6 +2421,23 @@ static char *format_harmony(const char *user) {
 }
 
 static int argmax(const float *x, int n) { int b=0; for(int i=1;i<n;++i) if(x[i]>x[b]) b=i; return b; }
+
+static void apply_repeat_penalty(float *logits, int vocab,
+                                 const int *history, int history_count,
+                                 float penalty) {
+    if (!logits || !history || history_count <= 0 || penalty <= 1.0f) return;
+    for (int i = 0; i < history_count; ++i) {
+        int token = history[i];
+        if (token < 0 || token >= vocab) continue;
+        int duplicate = 0;
+        for (int j = 0; j < i; ++j) {
+            if (history[j] == token) { duplicate = 1; break; }
+        }
+        if (duplicate) continue;
+        if (logits[token] <= 0.0f) logits[token] *= penalty;
+        else logits[token] /= penalty;
+    }
+}
 
 
 static void gptoss_light_print_escaped(FILE *out, const char *piece, int n) {
@@ -1739,13 +2471,17 @@ static void gptoss_light_token_generated(int index, int maximum, int token,
 static void usage(const char *p) {
     fprintf(stderr,
         "Usage: %s [--gguf] MODEL --prompt TEXT [--max-tokens N] [--context N] "
-        "[--device cpu|cuda[:N]] [--usage-file PATH] [--raw-prompt] [--verbose] "
-        "[--debug] [--debug-dir DIR] [--debug-light]\n", p);
+        "[--device cpu|cuda[:N]] [--usage-file PATH] [--repeat-penalty N] "
+        "[--expert-cache-mode stats|fixed] [--expert-cache-per-layer N] "
+        "[--raw-prompt] [--verbose] [--debug] [--debug-dir DIR] [--debug-light]\n", p);
 }
 
 int coli_gptoss_run_cli(int argc, char **argv) {
     const char *model_path=NULL,*prompt=NULL,*device_arg="cpu",*usage_file=NULL,*debug_dir=NULL;
+    const char *cache_mode=NULL;
+    int cache_per_layer=-1;
     int max_tokens=24,context=0,raw=0,verbose=0,debug=0,debug_light=0;
+    float repeat_penalty=1.0f;
     int i=1; if(i<argc&&!strcmp(argv[i],"--gguf"))++i; if(i<argc)model_path=argv[i++];
     for(;i<argc;++i){
         if(!strcmp(argv[i],"--prompt")&&i+1<argc)prompt=argv[++i];
@@ -1753,6 +2489,15 @@ int coli_gptoss_run_cli(int argc, char **argv) {
         else if(!strcmp(argv[i],"--context")&&i+1<argc)context=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--device")&&i+1<argc)device_arg=argv[++i];
         else if(!strcmp(argv[i],"--usage-file")&&i+1<argc)usage_file=argv[++i];
+        else if(!strcmp(argv[i],"--repeat-penalty")&&i+1<argc)repeat_penalty=strtof(argv[++i],NULL);
+        else if(!strcmp(argv[i],"--expert-cache-mode")&&i+1<argc)cache_mode=argv[++i];
+        else if(!strcmp(argv[i],"--expert-cache-per-layer")&&i+1<argc){
+            char *end=NULL; long value=strtol(argv[++i],&end,10);
+            if(end==argv[i]||*end||value<0||value>INT_MAX){
+                fprintf(stderr,"invalid --expert-cache-per-layer: %s\n",argv[i]);return 2;
+            }
+            cache_per_layer=(int)value;
+        }
         else if(!strcmp(argv[i],"--raw-prompt"))raw=1;
         else if(!strcmp(argv[i],"--verbose")||!strcmp(argv[i],"-v"))verbose=1;
         else if(!strcmp(argv[i],"--debug-light"))debug_light=1;
@@ -1762,7 +2507,7 @@ int coli_gptoss_run_cli(int argc, char **argv) {
         else if(!strcmp(argv[i],"--no-mtp")){}
         else {fprintf(stderr,"unknown GPT-OSS option: %s\n",argv[i]);usage(argv[0]);return 2;}
     }
-    if(!model_path||!prompt||max_tokens<0){usage(argv[0]);return 2;}
+    if(!model_path||!prompt||max_tokens<0||cache_per_layer < -1||!isfinite(repeat_penalty)||repeat_penalty<1.0f){usage(argv[0]);return 2;}
     /* RAM preload dots are always on; [LIGHT] token diagnostics are opt-in. */
 #ifdef _WIN32
     _putenv_s("COLI_RAM_PROGRESS", "1");
@@ -1782,22 +2527,24 @@ int coli_gptoss_run_cli(int argc, char **argv) {
     free(formatted);coli_gguf_tokenizer_destroy(tok);coli_gguf_close(&probe);
     if(n_prompt<=0){free(ids);fprintf(stderr,"prompt tokenization failed\n");return 1;}
     if(!context)context=n_prompt+max_tokens+1;if(context<n_prompt+max_tokens)context=n_prompt+max_tokens+1;
+    int *repeat_history=max_tokens?(int*)malloc((size_t)max_tokens*sizeof(*repeat_history)):NULL;
+    if(max_tokens&&!repeat_history){free(ids);fprintf(stderr,"cannot allocate repetition history\n");return 1;}
 
     ColiExec exec={COLI_BACKEND_CPU,0};int cuda_started=0; (void)cuda_started;
     if(!strcmp(device_arg,"cuda")||!strncmp(device_arg,"cuda:",5)){
         exec.kind=COLI_BACKEND_CUDA;if(device_arg[4]==':')exec.device=atoi(device_arg+5);
 #ifdef COLI_CUDA
-        if(!coli_cuda_init(&exec.device,1)){fprintf(stderr,"cannot initialize CUDA\n");free(ids);return 1;}cuda_started=1;
+        if(!coli_cuda_init(&exec.device,1)){fprintf(stderr,"cannot initialize CUDA\n");free(repeat_history);free(ids);return 1;}cuda_started=1;
 #else
-        fprintf(stderr,"binary built without CUDA\n");free(ids);return 1;
+        fprintf(stderr,"binary built without CUDA\n");free(repeat_history);free(ids);return 1;
 #endif
-    }else if(strcmp(device_arg,"cpu")){fprintf(stderr,"invalid device %s\n",device_arg);free(ids);return 2;}
+    }else if(strcmp(device_arg,"cpu")){fprintf(stderr,"invalid device %s\n",device_arg);free(repeat_history);free(ids);return 2;}
 
     GptOssModel m; memset(&m,0,sizeof(m)); m.gguf.fd=-1;
     GptOssScratch s={0};double t0=now_sec();
     if(!load_model_with_usage_debug(&m,model_path,usage_file,context,verbose,exec,
-                                    debug,debug_dir,err,sizeof(err))){
-        fprintf(stderr,"%s\n",err);model_free(&m);free(ids);
+                                    debug,debug_dir,cache_mode,cache_per_layer,err,sizeof(err))){
+        fprintf(stderr,"%s\n",err);model_free(&m);free(repeat_history);free(ids);
 #ifdef COLI_CUDA
         if(cuda_started)coli_cuda_shutdown();
 #endif
@@ -1805,7 +2552,7 @@ int coli_gptoss_run_cli(int argc, char **argv) {
     }
     double alloc0=gptoss_debug_clock(&m);
     if(!scratch_alloc(&m,&s,err,sizeof(err))){
-        fprintf(stderr,"%s\n",err);if(m.debug)m.debug->exit_status=1;model_free(&m);free(ids);
+        fprintf(stderr,"%s\n",err);if(m.debug)m.debug->exit_status=1;model_free(&m);free(repeat_history);free(ids);
 #ifdef COLI_CUDA
         if(cuda_started)coli_cuda_shutdown();
 #endif
@@ -1818,8 +2565,10 @@ int coli_gptoss_run_cli(int argc, char **argv) {
         fflush(stderr);
     }
     if(m.debug&&m.debug->enabled)
-        gptoss_debug_emit(&m,"event=inference_start|prompt_tokens=%d|max_tokens=%d|raw_prompt=%d|context=%d",
-                          n_prompt,max_tokens,raw,context);
+        gptoss_debug_emit(&m,"event=inference_start|prompt_tokens=%d|max_tokens=%d|raw_prompt=%d|context=%d|repeat_penalty=%.6f",
+                          n_prompt,max_tokens,raw,context,repeat_penalty);
+    if(verbose&&repeat_penalty>1.0f)
+        fprintf(stderr,"[GPT-OSS] repeat penalty=%.3f over generated text tokens\n",repeat_penalty);
 
     for (int p = 0; p < n_prompt; ++p) {
         GptOssTracePoint trace_prompt_point = gptoss_trace_point();
@@ -1859,7 +2608,7 @@ int coli_gptoss_run_cli(int argc, char **argv) {
     if(m.debug&&m.debug->enabled)
         gptoss_debug_emit(&m,"event=generation_start|prompt_tokens=%d|next_pos=%d",n_prompt,n_prompt);
 
-    int pos=n_prompt,generated=0;
+    int pos=n_prompt,generated=0,repeat_count=0;
     int stop_eos=coli_gguf_tokenizer_eos(m.tokenizer);
     int stop_return=coli_gguf_tokenizer_id(m.tokenizer,"<|return|>");
     int stop_call=coli_gguf_tokenizer_id(m.tokenizer,"<|call|>");
@@ -1869,6 +2618,7 @@ int coli_gptoss_run_cli(int argc, char **argv) {
     }
     while(generated<max_tokens){
         double op0=gptoss_debug_clock(&m);
+        apply_repeat_penalty(s.logits,m.vocab,repeat_history,repeat_count,repeat_penalty);
         int next=argmax(s.logits,m.vocab);
         if(op0)gptoss_debug_op(&m,-1,-1,"run","argmax","cpu",0,(now_sec()-op0)*1000.0);
         /* Harmony can emit several assistant messages. <|end|> separates them;
@@ -1876,7 +2626,9 @@ int coli_gptoss_run_cli(int argc, char **argv) {
         int stop=next==stop_eos||next==stop_return||next==stop_call;
         int control=coli_gguf_tokenizer_is_control(m.tokenizer,next);
         char piece[4096];int n=0;
-        if(!stop&&!control){
+        /* Decode Harmony control tokens too so message boundaries remain visible
+         * in stdout. They are protocol separators, not completion stops. */
+        if(!stop){
             op0=gptoss_debug_clock(&m);
             n=coli_gguf_tokenizer_decode(m.tokenizer,&next,1,piece,sizeof(piece));
             if(op0)gptoss_debug_op(&m,-1,-1,"run","token_decode","cpu",0,(now_sec()-op0)*1000.0);
@@ -1889,7 +2641,8 @@ int coli_gptoss_run_cli(int argc, char **argv) {
                 gptoss_debug_emit(&m,"event=generation_stop|reason=stop_token|generated=%d|token=%d",generated,next);
             break;
         }
-        if(!control&&n>0){fwrite(piece,1,(size_t)n,stdout);fflush(stdout);}
+        if(n>0){fwrite(piece,1,(size_t)n,stdout);fflush(stdout);}
+        if(!control)repeat_history[repeat_count++]=next;
         ++generated;
         if(generated>=max_tokens){
             if(m.debug&&m.debug->enabled)
@@ -1927,7 +2680,7 @@ int coli_gptoss_run_cli(int argc, char **argv) {
         double free0=gptoss_debug_clock(&m);scratch_free(&s);
         if(free0)gptoss_debug_op(&m,-1,-1,"free","scratch_free","host",0,(now_sec()-free0)*1000.0);
     }
-    model_free(&m);free(ids);
+    model_free(&m);free(repeat_history);free(ids);
 #ifdef COLI_CUDA
     if(cuda_started)coli_cuda_shutdown();
 #endif
@@ -1946,7 +2699,7 @@ fail:
         double free0=gptoss_debug_clock(&m);scratch_free(&s);
         if(free0)gptoss_debug_op(&m,-1,-1,"free","scratch_free","host",0,(now_sec()-free0)*1000.0);
     }
-    model_free(&m);free(ids);
+    model_free(&m);free(repeat_history);free(ids);
 #ifdef COLI_CUDA
     if(cuda_started)coli_cuda_shutdown();
 #endif

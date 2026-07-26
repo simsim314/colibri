@@ -32,7 +32,6 @@ typedef struct {
     int have_ram_runtime_override;
     int have_vram_runtime_override;
     int context;
-    int expert_cache_per_layer;
     int device;
     int command_only;
 } Options;
@@ -51,11 +50,8 @@ typedef struct {
     uint64_t expert_ff;
     uint64_t vocab;
     uint64_t dense_vram_candidate_bytes;
-    uint64_t expert_cache_raw_bytes;
-    uint64_t expert_cache_reserve_bytes;
     uint64_t runtime_ram_bytes;
     uint64_t runtime_vram_bytes;
-    int effective_cache_per_layer;
     int dense_all_or_none;
 } ModelProfile;
 
@@ -113,7 +109,6 @@ static void usage(const char *p) {
         "  --vram-breathing-mib N           free VRAM after runtime allocations; default 128\n"
         "  --vram-reserve-mib N             compatibility alias for --vram-breathing-mib\n"
         "  --context N                      context used for runtime estimates; default 4096\n"
-        "  --expert-cache-per-layer N       default GPTOSS_EXPERT_CACHE_PER_LAYER or model top-k\n"
         "  --vram-workspace-mib N           CUDA context/scratch reserve; default 256\n"
         "  --runtime-ram-mib N              override automatic runtime RAM estimate\n"
         "  --runtime-vram-mib N             override cache+workspace VRAM estimate\n"
@@ -129,7 +124,6 @@ static int parse_args(int argc, char **argv, Options *o) {
     o->model = argv[1];
     o->device = 0;
     o->context = 4096;
-    o->expert_cache_per_layer = -1;
     o->fast_reserve = mib(384);
     o->ram_breathing = mib(384);
     o->vram_breathing = mib(128);
@@ -154,7 +148,6 @@ static int parse_args(int argc, char **argv, Options *o) {
             o->vram_runtime_override = mib(v); o->have_vram_runtime_override = 1;
         }
         else if (!strcmp(argv[i], "--context") && parse_int_arg(argc, argv, &i, &iv) && iv > 0) o->context = iv;
-        else if (!strcmp(argv[i], "--expert-cache-per-layer") && parse_int_arg(argc, argv, &i, &iv) && iv > 0) o->expert_cache_per_layer = iv;
         else if (!strcmp(argv[i], "--device") && parse_int_arg(argc, argv, &i, &iv)) o->device = iv;
         else if (!strcmp(argv[i], "--command-only")) o->command_only = 1;
         else return 0;
@@ -269,36 +262,11 @@ static void profile_model(const ColiGgufFile *model, const Options *o, ModelProf
     p->kv_dim = sat_mul(p->kv_heads, p->head_dim);
     p->q_dim = sat_mul(p->heads, p->head_dim);
 
-    int requested_cache = o->expert_cache_per_layer;
-    if (requested_cache < 0) {
-        const char *env = getenv("GPTOSS_EXPERT_CACHE_PER_LAYER");
-        requested_cache = env && atoi(env) > 0 ? atoi(env) : (int)(p->top_k ? p->top_k : 4);
-    }
-    if (p->top_k && requested_cache < (int)p->top_k) requested_cache = (int)p->top_k;
-    if (p->experts && requested_cache > (int)p->experts) requested_cache = (int)p->experts;
-    if (requested_cache < 1) requested_cache = 1;
-    p->effective_cache_per_layer = requested_cache;
-
     for (uint64_t i = 0; i < model->tensor_count; ++i) {
         const ColiGgufTensorInfo *t = &model->tensors[i];
         if (coli_split_is_vram_candidate(t))
             p->dense_vram_candidate_bytes = sat_add(p->dense_vram_candidate_bytes, t->payload_size);
-
-        if (coli_split_is_expert_tensor(t) && t->expert_count > 0 &&
-            contains_ci(t->name, "weight") && !contains_ci(t->name, "bias")) {
-            uint64_t per_expert = (t->payload_size + t->expert_count - 1u) / t->expert_count;
-            uint64_t slots = (uint64_t)p->effective_cache_per_layer;
-            if (slots > t->expert_count) slots = t->expert_count;
-            p->expert_cache_raw_bytes = sat_add(
-                p->expert_cache_raw_bytes,
-                sat_mul(per_expert, slots));
-        }
     }
-
-    /* CUDA tensor objects, row views and allocator granularity add overhead. */
-    p->expert_cache_reserve_bytes = sat_add(
-        p->expert_cache_raw_bytes,
-        sat_add(p->expert_cache_raw_bytes / 20u, mib(16)));
 
     if (!strcmp(p->architecture, "gpt-oss")) {
         uint64_t context = (uint64_t)o->context;
@@ -317,7 +285,9 @@ static void profile_model(const ColiGgufFile *model, const Options *o, ModelProf
         p->runtime_ram_bytes = mib(256);
     }
 
-    p->runtime_vram_bytes = sat_add(p->expert_cache_reserve_bytes, o->vram_workspace);
+    /* The runtime stats cache greedily consumes VRAM left after static
+     * placement. Only CUDA context/scratch must be reserved here. */
+    p->runtime_vram_bytes = o->vram_workspace;
     if (o->have_ram_runtime_override) p->runtime_ram_bytes = o->ram_runtime_override;
     if (o->have_vram_runtime_override) p->runtime_vram_bytes = o->vram_runtime_override;
 }
@@ -463,8 +433,7 @@ int main(int argc, char **argv) {
     printf("\nVRAM (device %d):\n", o.device);
     if (have_vram) {
         uint64_t used_vram = total_vram > free_vram ? total_vram - free_vram : 0;
-        uint64_t workspace = profile.runtime_vram_bytes > profile.expert_cache_reserve_bytes
-            ? profile.runtime_vram_bytes - profile.expert_cache_reserve_bytes : 0;
+        uint64_t workspace = profile.runtime_vram_bytes;
         uint64_t after_plan = free_vram;
         after_plan = after_plan > o.vram_breathing ? after_plan - o.vram_breathing : 0;
         after_plan = after_plan > profile.runtime_vram_bytes ? after_plan - profile.runtime_vram_bytes : 0;
@@ -472,8 +441,7 @@ int main(int argc, char **argv) {
 
         printf("  total / free now:         %s / %s\n", human(total_vram, a), human(free_vram, b));
         printf("  currently occupied:       %s\n", human(used_vram, c));
-        printf("  dynamic expert cache:     %s (%d experts/layer)\n",
-               human(profile.expert_cache_reserve_bytes, e), profile.effective_cache_per_layer);
+        printf("  dynamic stats cache:      remaining VRAM after static placement\n");
         printf("  CUDA context/workspace:   %s\n", human(workspace, f));
         printf("  breathing reserve:        %s\n", human(o.vram_breathing, g));
         printf("  safe static capacity:     %s\n", human(vram_static_capacity, h));
@@ -518,9 +486,9 @@ int main(int argc, char **argv) {
     printf("\nRecommended command:\n");
     print_command(&o, fast_path, preload_path, tail_path,
                   fast_budget, ram_budget, vram_budget);
-    printf("\nRecommended matching runtime cache setting:\n");
-    printf("GPTOSS_EXPERT_CACHE_PER_LAYER=%d ./c/colibri --gguf '%s' ...\n",
-           profile.effective_cache_per_layer, fast_path);
+    printf("\nRecommended runtime cache setting:\n");
+    printf("GPTOSS_EXPERT_CACHE_RESERVE_MIB=384 ./c/colibri --gguf '%s' --usage-file '%s' ...\n",
+           fast_path, o.usage_file);
 
     coli_split_plan_destroy(&plan);
     coli_gguf_close(&model);

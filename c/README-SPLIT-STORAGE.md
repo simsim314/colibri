@@ -64,12 +64,17 @@ the terminal:
 Run the exact `sgguf-split` command printed by the planner. Manual budgets are
 also supported directly by `sgguf-split`.
 
-At runtime, use the same cache setting used for planning:
+At runtime, the GPT-OSS CUDA cache is selected automatically from the usage
+file and the VRAM that remains after split preloads and dense weights:
 
 ```bash
-GPTOSS_EXPERT_CACHE_PER_LAYER=4 \
+GPTOSS_EXPERT_CACHE_RESERVE_MIB=384 \
 COLI_SPLIT_VERBOSE=1 \
-./c/colibri --gguf MODEL.fast.split.gguf --device cuda ...
+./c/colibri --gguf MODEL.fast.split.gguf --device cuda \
+  --usage-file MODEL.coli_usage ...
 ```
 
-`COLI_SPLIT_VERBOSE=1` reports actual RAM and VRAM preload activity.
+`GPTOSS_EXPERT_CACHE_MIB` can cap the automatic runtime cache. Cache capacity is
+allocated globally by historical selections per encoded byte, not by a fixed
+number of experts per layer. `COLI_SPLIT_VERBOSE=1` reports actual RAM and VRAM
+preload activity.

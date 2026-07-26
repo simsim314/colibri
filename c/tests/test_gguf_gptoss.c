@@ -166,6 +166,96 @@ static void write_fixture(const char *path) {
     assert(fclose(f) == 0);
 }
 
+
+static int candidate_selected(const GptOssCacheCandidate *items, int count,
+                              int layer, int eid) {
+    for (int i = 0; i < count; ++i)
+        if (items[i].layer == layer && items[i].eid == eid)
+            return items[i].selected;
+    return 0;
+}
+
+static void test_stats_cache_greedy(void) {
+    GptOssCacheCandidate items[] = {
+        {0, 0, 100, 100, 0, 0},
+        {1, 0,  90,  30, 0, 0},
+        {1, 1,  80,  30, 0, 0},
+        {2, 0,   0,   0, 1, 0},
+    };
+    size_t bytes = 0;
+    int selected = gptoss_cache_select_greedy(
+        items, (int)(sizeof(items) / sizeof(items[0])), 60, &bytes);
+    assert(selected == 3);
+    assert(bytes == 60);
+    assert(!candidate_selected(items, 4, 0, 0));
+    assert(candidate_selected(items, 4, 1, 0));
+    assert(candidate_selected(items, 4, 1, 1));
+    assert(candidate_selected(items, 4, 2, 0));
+}
+
+static void test_cache_mode_flags(void) {
+    GptOssModel m;
+    char err[256];
+
+    memset(&m, 0, sizeof(m));
+    m.top_k = 4; m.n_experts = 128;
+    assert(gptoss_cache_configure(&m, "stats", -1, err, sizeof(err)));
+    assert(m.expert_cache_mode == GPTOSS_EXPERT_CACHE_STATS);
+
+    memset(&m, 0, sizeof(m));
+    m.top_k = 4; m.n_experts = 128;
+    assert(gptoss_cache_configure(&m, "fixed", 2, err, sizeof(err)));
+    assert(m.expert_cache_mode == GPTOSS_EXPERT_CACHE_FIXED);
+    assert(m.expert_cache_fixed_per_layer == 2);
+
+    memset(&m, 0, sizeof(m));
+    m.top_k = 4; m.n_experts = 128;
+    assert(gptoss_cache_configure(&m, NULL, 3, err, sizeof(err)));
+    assert(m.expert_cache_mode == GPTOSS_EXPERT_CACHE_FIXED);
+    assert(m.expert_cache_fixed_per_layer == 3);
+
+    memset(&m, 0, sizeof(m));
+    m.top_k = 4; m.n_experts = 128;
+    assert(!gptoss_cache_configure(&m, "stats", 2, err, sizeof(err)));
+}
+
+static void test_repeat_penalty(void) {
+    float logits[4] = {8.0f, -2.0f, 3.0f, 1.0f};
+    const int history[4] = {0, 1, 0, 9};
+    apply_repeat_penalty(logits, 4, history, 4, 2.0f);
+    assert(closef(logits[0], 4.0f, 1e-7f));
+    assert(closef(logits[1], -4.0f, 1e-7f));
+    assert(closef(logits[2], 3.0f, 1e-7f));
+    assert(closef(logits[3], 1.0f, 1e-7f));
+}
+
+static void test_mmap_read_pool(void) {
+    uint8_t source[4][64];
+    uint8_t output[4][64];
+    GptOssMmapReadTask tasks[4];
+    memset(tasks, 0, sizeof(tasks));
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 64; ++j) source[i][j] = (uint8_t)(i * 64 + j);
+        memset(output[i], 0, sizeof(output[i]));
+        tasks[i].source = source[i];
+        tasks[i].buffer = output[i];
+        tasks[i].bytes = sizeof(output[i]);
+    }
+    GptOssMmapReadPool pool;
+    assert(gptoss_mmap_read_pool_init(&pool, 3) == 3);
+    gptoss_mmap_read_pool_run(&pool, tasks, 4);
+    for (int i = 0; i < 4; ++i) {
+        assert(tasks[i].ok);
+        assert(memcmp(source[i], output[i], sizeof(output[i])) == 0);
+        tasks[i].ok = 0;
+        memset(output[i], 0, sizeof(output[i]));
+    }
+    gptoss_mmap_read_pool_run(&pool, tasks, 4);
+    for (int i = 0; i < 4; ++i)
+        assert(memcmp(source[i], output[i], sizeof(output[i])) == 0);
+    gptoss_mmap_read_pool_destroy(&pool);
+}
+
 static void test_math_helpers(void) {
     assert(closef(coli_gptoss_oai_swiglu(0.0f, 0.0f), 0.0f, 1e-7f));
     float a = coli_gptoss_oai_swiglu(100.0f, 100.0f);
@@ -234,6 +324,10 @@ static void test_model_load_and_forward(void) {
 }
 
 int main(void) {
+    test_stats_cache_greedy();
+    test_cache_mode_flags();
+    test_repeat_penalty();
+    test_mmap_read_pool();
     test_math_helpers();
     test_model_load_and_forward();
     puts("test_gguf_gptoss: ok");

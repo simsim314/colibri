@@ -753,7 +753,7 @@ static int load_model(GraniteModel*m,const char*path,int context,int verbose,Col
 }
 
 static void usage(const char*prog){
-    fprintf(stderr,"Usage: %s [--gguf] MODEL.gguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--raw-prompt] [--verbose] [--debug-light]\n",prog);
+    fprintf(stderr,"Usage: %s [--gguf] MODEL.gguf --prompt TEXT [--max-tokens N] [--context N] [--device cpu|cuda[:N]] [--usage-file PATH] [--repeat-penalty N] [--expert-cache-mode stats|fixed] [--expert-cache-per-layer N] [--raw-prompt] [--verbose] [--debug-light]\n",prog);
 }
 int coli_gguf_cli_requested(int argc,char**argv){
     if(argc>1&&!strcmp(argv[1],"--gguf"))return 1;
@@ -769,6 +769,10 @@ int coli_gguf_run_cli(int argc,char**argv){
         else if(!strcmp(argv[i],"--max-tokens")&&i+1<argc)max_tokens=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--device")&&i+1<argc)device_arg=argv[++i];
         else if(!strcmp(argv[i],"--usage-file")&&i+1<argc)++i; /* model-specific dispatch consumes it */
+        else if(!strcmp(argv[i],"--context")&&i+1<argc)++i; /* GPT-OSS dispatch consumes it */
+        else if(!strcmp(argv[i],"--repeat-penalty")&&i+1<argc)++i; /* GPT-OSS dispatch consumes it */
+        else if(!strcmp(argv[i],"--expert-cache-mode")&&i+1<argc)++i; /* GPT-OSS dispatch consumes it */
+        else if(!strcmp(argv[i],"--expert-cache-per-layer")&&i+1<argc)++i; /* GPT-OSS dispatch consumes it */
         else if(!strcmp(argv[i],"--mtp-draft")&&i+1<argc)++i; /* qwen35moe dispatch consumes it */
         else if(!strcmp(argv[i],"--no-mtp")){} /* qwen35moe dispatch consumes it */
         else if(!strcmp(argv[i],"--debug")){} /* gpt-oss dispatch consumes --debug */

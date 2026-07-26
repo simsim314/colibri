@@ -70,7 +70,8 @@ byte-for-byte.
 For reference comparisons, supply an already rendered Harmony prompt:
 
 ```bash
-GPTOSS_EXPERT_CACHE_PER_LAYER=4 \
+GPTOSS_MMAP_READERS=12 \
+GPTOSS_EXPERT_CACHE_RESERVE_MIB=384 \
 ./c/colibri \
   --gguf "$OUT" \
   --device cuda \
@@ -78,9 +79,37 @@ GPTOSS_EXPERT_CACHE_PER_LAYER=4 \
   --raw-prompt \
   --prompt "$HARMONY_PROMPT" \
   --max-tokens 80 \
+  --repeat-penalty 1.10 \
   --verbose
 ```
 
 Without `--raw-prompt`, Colibri renders a basic system/user/assistant Harmony
-conversation. `GPTOSS_EXPERT_CACHE_PER_LAYER` controls selected expert views
-retained per layer; it is never set below the model's active-expert count.
+conversation.
+
+The default `--expert-cache-mode stats` plans the CUDA expert cache globally
+from the cumulative usage file. Each `(layer, expert)` bundle is ranked greedily
+by historical selections per encoded byte, and the hottest bundles are uploaded
+until the available VRAM budget is filled. Cache counts therefore vary by layer.
+`GPTOSS_EXPERT_CACHE_RESERVE_MIB` keeps runtime headroom free (default `384`).
+`GPTOSS_EXPERT_CACHE_MIB` optionally caps the automatic cache budget.
+
+Use `--expert-cache-mode fixed --expert-cache-per-layer N` to select the older
+per-layer runtime LRU cache. For backward compatibility,
+`GPTOSS_EXPERT_CACHE_PER_LAYER=N` also selects fixed mode when no CLI cache mode
+is supplied. CLI flags take priority over environment variables.
+
+In stats mode, a miss replaces the coldest evictable expert in that layer only
+after its cumulative count becomes higher. In fixed mode, misses use ordinary
+per-layer LRU replacement.
+
+`GPTOSS_MMAP_READERS` enables a persistent worker pool for selected dense
+experts that are still disk-backed. After routing, gate/up/down slices are
+copied from mmap into temporary RAM buffers in parallel before CPU execution
+or CUDA upload. Existing preload-RAM tensors and CUDA-resident experts are
+skipped. The worker count is capped at `3 * top_k` (12 for GPT-OSS top-4).
+This is parallel demand loading only; it does not prefetch the next layer.
+
+`--repeat-penalty N` applies a sign-aware penalty once per unique generated
+text token before greedy argmax. The default is `1.0` (disabled); values around
+`1.05` to `1.15` are useful for reducing deterministic repetition without
+penalizing Harmony control tokens.

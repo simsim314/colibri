@@ -117,7 +117,19 @@ static void test_tiled_value_head_mapping(void){
     assert(fabsf(out[6])<1e-6f&&fabsf(out[7])<1e-6f);/* vh3 -> kh1 */
 }
 
+static void test_repeat_penalty_argmax(void) {
+    Q35Model m;
+    memset(&m, 0, sizeof(m));
+    float logits[4] = {8.0f, -2.0f, 3.0f, 1.0f};
+    unsigned char seen[4] = {1, 0, 0, 0};
+    assert(q35_argmax_repeat(&m, logits, 4, seen, NULL, 0, 4.0f) == 2);
+    const int extra[1] = {2};
+    assert(q35_argmax_repeat(&m, logits, 4, seen, extra, 1, 4.0f) == 0);
+    assert(q35_argmax_repeat(&m, logits, 4, seen, NULL, 0, 1.0f) == 0);
+}
+
 int main(void){
+    test_repeat_penalty_argmax();
     test_separate_delta();
     test_tiled_value_head_mapping();
     char path[256];
@@ -143,7 +155,7 @@ int main(void){
     assert(q35_mtp_update_kv(&m,&s,2,1,err,sizeof(err))); /* token 1 + target h[0] */
     assert(m.mtp_steps==0&&m.mtp_kv_updates==2);
     assert(q35_forward(&m,&s,2,1,err,sizeof(err)));
-    int draft=-1;assert(q35_mtp_make_drafts(&m,&s,2,2,1,&draft,err,sizeof(err))==1);assert(draft==2);
+    int draft=-1;assert(q35_mtp_make_drafts(&m,&s,2,2,1,&draft,NULL,1.0f,err,sizeof(err))==1);assert(draft==2);
     assert(m.mtp_steps==1&&m.mtp_kv_updates==2);
 
     /* A two-position target verification block must be numerically identical

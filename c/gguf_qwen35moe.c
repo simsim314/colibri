@@ -2718,6 +2718,10 @@ static int q35_mtp_catchup_batch(Q35Model *m, Q35Scratch *s,
 }
 
 static int q35_argmax(const float *x, int n);
+static int q35_argmax_repeat(const Q35Model *m, const float *x, int n,
+                              const unsigned char *seen,
+                              const int *extra, int extra_count,
+                              float penalty);
 static int q35_forward(Q35Model *m, Q35Scratch *s, int token, int pos,
                         char *err, size_t cap) {
     int ok;
@@ -2750,13 +2754,16 @@ static int q35_mtp_forward(Q35Model *m, Q35Scratch *s, int token,
 
 static int q35_mtp_make_drafts(Q35Model *m, Q35Scratch *s, int seed_token,
                                 int base_pos, int max_drafts, int *drafts,
+                                const unsigned char *repeat_seen,
+                                float repeat_penalty,
                                 char *err, size_t cap) {
     if (!m->mtp_enabled || max_drafts <= 0) return 0;
     int token = seed_token;
     int n = 0;
     for (; n < max_drafts; ++n) {
         if (!q35_mtp_forward(m, s, token, base_pos + n, n > 0, err, cap)) return -1;
-        token = q35_argmax(s->mtp_logits, m->vocab);
+        token = q35_argmax_repeat(m, s->mtp_logits, m->vocab,
+                                  repeat_seen, drafts, n, repeat_penalty);
         drafts[n] = token;
         ++m->mtp_proposed;
         if (token == coli_gguf_tokenizer_eos(m->tokenizer)) { ++n; break; }
@@ -2768,6 +2775,36 @@ static int q35_argmax(const float *x, int n) {
     int best = 0;
     for (int i = 1; i < n; ++i) if (x[i] > x[best]) best = i;
     return best;
+}
+
+static int q35_argmax_repeat(const Q35Model *m, const float *x, int n,
+                              const unsigned char *seen,
+                              const int *extra, int extra_count,
+                              float penalty) {
+    if (!x || n <= 0) return 0;
+    if (!seen || penalty <= 1.0f) return q35_argmax(x, n);
+    int best = 0;
+    float best_score = -INFINITY;
+    for (int token = 0; token < n; ++token) {
+        int repeated = seen[token] != 0;
+        if (!repeated && extra) {
+            for (int j = 0; j < extra_count; ++j) {
+                if (extra[j] == token) { repeated = 1; break; }
+            }
+        }
+        if (repeated && m && m->tokenizer &&
+            coli_gguf_tokenizer_is_control(m->tokenizer, token))
+            repeated = 0;
+        float score = x[token];
+        if (repeated) score = score <= 0.0f ? score * penalty : score / penalty;
+        if (score > best_score) { best_score = score; best = token; }
+    }
+    return best;
+}
+
+static void q35_repeat_record(const Q35Model *m, unsigned char *seen, int token) {
+    if (!seen || !m || token < 0 || token >= m->vocab) return;
+    if (!coli_gguf_tokenizer_is_control(m->tokenizer, token)) seen[token] = 1;
 }
 
 static int q35_parse_expert_zero_threshold(Q35Model *m, char *err, size_t cap) {
@@ -2879,13 +2916,14 @@ static int q35_emit_token(Q35Model *m, int token) {
 
 static void q35_usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s [--gguf] MODEL.gguf|MODEL.sgguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--mtp-draft 0..8] [--no-mtp] [--raw-prompt] [--verbose]\n",
+        "Usage: %s [--gguf] MODEL.gguf|MODEL.sgguf --prompt TEXT [--max-tokens N] [--device cpu|cuda[:N]] [--repeat-penalty N] [--mtp-draft 0..8] [--no-mtp] [--raw-prompt] [--verbose]\n",
         prog);
 }
 
 int coli_qwen35moe_run_cli(int argc, char **argv) {
     const char *model_path = NULL, *prompt = NULL, *device_arg = "cpu";
     int max_tokens = 24, raw = 0, verbose = 0;
+    float repeat_penalty = 1.0f;
     int mtp_draft_max = 0;
     const char *mtp_env = getenv("QWEN35_MTP_DRAFT");
     if (mtp_env && *mtp_env) mtp_draft_max = atoi(mtp_env);
@@ -2896,13 +2934,18 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
         if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device_arg = argv[++i];
+        else if (!strcmp(argv[i], "--repeat-penalty") && i + 1 < argc) repeat_penalty = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--mtp-draft") && i + 1 < argc) mtp_draft_max = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-mtp")) mtp_draft_max = 0;
         else if (!strcmp(argv[i], "--raw-prompt")) raw = 1;
         else if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) verbose = 1;
         else { fprintf(stderr, "unknown Q35 GGUF option: %s\n", argv[i]); q35_usage(argv[0]); return 2; }
     }
-    if (!model_path || !prompt || max_tokens < 0 || mtp_draft_max < 0 || mtp_draft_max > 8) { q35_usage(argv[0]); return 2; }
+    if (!model_path || !prompt || max_tokens < 0 ||
+        !isfinite(repeat_penalty) || repeat_penalty < 1.0f ||
+        mtp_draft_max < 0 || mtp_draft_max > 8) {
+        q35_usage(argv[0]); return 2;
+    }
 
     ColiGgufFile probe; probe.fd = -1;
     ColiGgufTokenizer *pt = NULL;
@@ -2968,6 +3011,17 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
 #endif
         return 1;
     }
+    unsigned char *repeat_seen = (unsigned char *)calloc((size_t)m.vocab, 1);
+    if (!repeat_seen) {
+        fprintf(stderr, "out of memory allocating Q35 repeat-penalty history\n");
+        q35_scratch_free(&s); q35_model_free(&m); free(ids);
+#ifdef COLI_CUDA
+        if (cuda_started) coli_cuda_shutdown();
+#endif
+        return 1;
+    }
+    if (verbose && repeat_penalty > 1.0f)
+        fprintf(stderr, "[Q35] repeat penalty=%.3f over generated text tokens\n", repeat_penalty);
 
     const double t0 = q35_now_sec();
     for (int p = 0; p < n_prompt; ++p) {
@@ -2985,6 +3039,19 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
         if (!q35_forward(&m, &s, ids[p], p, err, sizeof(err))) {
             fprintf(stderr, "%s\n", err); goto fail;
         }
+        /* Echo the exact formatted model input one token at a time after
+         * each prefill step, matching the GPT-OSS runtime.  Decode control
+         * tokens too so the displayed text is the actual tokenizer input,
+         * not only the user-supplied --prompt string. */
+        {
+            char input_piece[4096];
+            const int input_n = coli_gguf_tokenizer_decode(
+                m.tokenizer, &ids[p], 1, input_piece, (int)sizeof(input_piece));
+            if (input_n > 0) {
+                fwrite(input_piece, 1, (size_t)input_n, stdout);
+                fflush(stdout);
+            }
+        }
     }
     int pos = n_prompt, generated = 0;
     int pending = -1;
@@ -2998,10 +3065,12 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
             pending = -1;
             already_emitted = 1;
         } else {
-            current = q35_argmax(s.logits, m.vocab);
+            current = q35_argmax_repeat(&m, s.logits, m.vocab,
+                                        repeat_seen, NULL, 0, repeat_penalty);
         }
         if (!already_emitted) {
             if (!q35_emit_token(&m, current)) break;
+            q35_repeat_record(&m, repeat_seen, current);
             ++generated;
             if (generated >= max_tokens) break;
         }
@@ -3016,7 +3085,8 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
         int want = m.mtp_draft_max;
         if (want > max_tokens - generated) want = max_tokens - generated;
         int nd = q35_mtp_make_drafts(&m, &s, current, pos, want,
-                                     drafts, err, sizeof(err));
+                                     drafts, repeat_seen, repeat_penalty,
+                                     err, sizeof(err));
         if (nd < 0) {
             if (verbose) fprintf(stderr, "\n[MTP] draft failed (%s); disabling MTP and continuing normally\n", err);
             m.mtp_enabled = 0;
@@ -3038,7 +3108,9 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
                     m.mtp_verify_tokens += (uint64_t)verify_n;
                     int mismatch = -1, mismatch_actual = -1;
                     for (int j = 0; j < nd; ++j) {
-                        const int actual = q35_argmax(s.vlogits + (size_t)j * m.vocab, m.vocab);
+                        const int actual = q35_argmax_repeat(
+                            &m, s.vlogits + (size_t)j * m.vocab, m.vocab,
+                            repeat_seen, NULL, 0, repeat_penalty);
                         if (actual == coli_gguf_tokenizer_eos(m.tokenizer)) {
                             stop_generation = 1;
                             break;
@@ -3046,6 +3118,7 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
                         if (actual == drafts[j]) ++m.mtp_accepted;
                         else { mismatch = j; mismatch_actual = actual; }
                         if (!q35_emit_token(&m, actual)) { stop_generation = 1; break; }
+                        q35_repeat_record(&m, repeat_seen, actual);
                         ++generated;
                         if (generated >= max_tokens) { stop_generation = 1; break; }
                         if (mismatch >= 0) break;
@@ -3064,13 +3137,16 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
                             /* Row nd predicts the bonus token after every
                              * draft was accepted.  The target has consumed
                              * current plus all nd drafts (verify_n rows). */
-                            const int bonus = q35_argmax(s.vlogits + (size_t)nd * m.vocab, m.vocab);
+                            const int bonus = q35_argmax_repeat(
+                                &m, s.vlogits + (size_t)nd * m.vocab, m.vocab,
+                                repeat_seen, NULL, 0, repeat_penalty);
                             pos += verify_n;
                             if (bonus == coli_gguf_tokenizer_eos(m.tokenizer)) {
                                 stop_generation = 1;
                             } else {
                                 if (!q35_emit_token(&m, bonus)) stop_generation = 1;
                                 else {
+                                    q35_repeat_record(&m, repeat_seen, bonus);
                                     ++generated;
                                     if (generated >= max_tokens) stop_generation = 1;
                                     else pending = bonus;
@@ -3133,7 +3209,9 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
             if (!q35_forward(&m, &s, verify_token, pos++, err, sizeof(err))) {
                 fprintf(stderr, "\n%s\n", err); goto fail;
             }
-            const int actual = q35_argmax(s.logits, m.vocab);
+            const int actual = q35_argmax_repeat(&m, s.logits, m.vocab,
+                                                  repeat_seen, NULL, 0,
+                                                  repeat_penalty);
             if (actual == coli_gguf_tokenizer_eos(m.tokenizer)) {
                 stop_generation = 1;
                 break;
@@ -3141,6 +3219,7 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
             const int accepted = j < nd && drafts[j] == actual;
             if (accepted) ++m.mtp_accepted;
             if (!q35_emit_token(&m, actual)) { stop_generation = 1; break; }
+            q35_repeat_record(&m, repeat_seen, actual);
             ++generated;
             if (generated >= max_tokens) { stop_generation = 1; break; }
             if (!accepted || j + 1 >= nd) {
@@ -3208,14 +3287,14 @@ int coli_qwen35moe_run_cli(int argc, char **argv) {
                 (unsigned long long)m.expert_prune_values_seen, pct);
         }
     }
-    q35_usage_save(&m); q35_scratch_free(&s); q35_model_free(&m); free(ids);
+    q35_usage_save(&m); free(repeat_seen); q35_scratch_free(&s); q35_model_free(&m); free(ids);
 #ifdef COLI_CUDA
     if (cuda_started) coli_cuda_shutdown();
 #endif
     return 0;
 
 fail:
-    q35_usage_save(&m); q35_scratch_free(&s); q35_model_free(&m); free(ids);
+    q35_usage_save(&m); free(repeat_seen); q35_scratch_free(&s); q35_model_free(&m); free(ids);
 #ifdef COLI_CUDA
     if (cuda_started) coli_cuda_shutdown();
 #endif
